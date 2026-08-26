@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Refuse to commit credential files even if .gitignore is bypassed.
+set -e
+
+BLOCKED='(^|/)(vertexai\.json|database_config\.json|.*\.pem|\.env)$'
+LEAKED=$(git diff --cached --name-only --diff-filter=ACMRT | grep -E "$BLOCKED" || true)
+
+if [ -n "$LEAKED" ]; then
+    echo "❌  Refusing to commit credentials:"
+    echo "$LEAKED" | sed 's/^/    /'
+    echo
+    echo "If this is a deliberate example/template, rename it (e.g. *.example)."
+    exit 1
+fi
