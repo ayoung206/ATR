@@ -1,24 +1,110 @@
-# ATR (AgenticTableRAG)
+# Every Answer Has Its Own Path: Agentic Routing for Retrieval-Augmented Table Question Answering
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-Reference implementation of **"Every Answer Has Its Own Path: Agentic Routing for Retrieval-Augmented Table Question Answering"**.
+Repository for the EMNLP 2026 paper _"Every Answer Has Its Own Path: Agentic Routing for Retrieval-Augmented Table Question Answering"_.
 
-ATR is a hybrid table-text question-answering framework that
-1. decomposes a question into ordered sub-queries,
-2. routes each sub-query to one of four execution primitives (TEXT / RETRIEVE / SQL / HYBRID),
-3. value-links retrieved cells to canonical surface forms before any SQL is issued, and
-4. verifies each sub-answer; on rejection, re-invokes the router with the failed-route history.
+![ATR architecture](./figures/architecture.png)
 
-The routing policy is distilled into a lightweight DistilBERT student model that incurs no per-sub-query LLM call at inference time.
+## Introduction
 
----
+- We identify two failure modes of existing agentic table-text QA systems: they commit to a single execution strategy at the question level, and they suffer a **soft-retrieval / hard-execution gap**, where embedding retrieval ranks the correct cell as a candidate yet SQL execution still misses the row because the question's surface form never matches the stored value.
+- We propose **ATR (AgenticTableRAG)**, which decomposes a question into sub-queries and routes each one to `TEXT` / `RETRIEVE` / `SQL` / `HYBRID` over a shared 5-view index. A **HybridValueLinker** grounds entity mentions to values that exist in the cell index before any SQL is issued, and a verifier rejects weak sub-answers and re-invokes the router with the failed-route history.
+- The routing policy is distilled into a **DistilBERT student** that recovers 98.6% of the LLM teacher's decisions at zero per-sub-query LLM cost. A single configuration leads on token F1 across HybridQA, TAT-QA, and WTQ, and transfers unchanged to MultiHiertt and SPARTA, which the router never saw.
+
+## Setup
+
+### Environment
+
+```bash
+git clone https://github.com/ayoung206/ATR.git && cd ATR
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+python -m atr.smoke               # 5-check install verification (~10 s)
+```
+
+### External dependencies
+
+1. **Vertex AI service-account JSON** at `./vertexai.json` (or set `VERTEXAI_CREDENTIALS_PATH`).
+2. **BGE-M3 embedder**: download from HuggingFace and pass the parent directory to `--bge_dir`:
+   ```bash
+   huggingface-cli download BAAI/bge-m3 --local-dir ./models/bge-m3
+   ```
+3. **The Flask SQL service** (for the `SQL` / `HYBRID` primitives). ATR does not
+   ship it. Use the implementation released with TableRAG (Yu et al., EMNLP
+   2025) and follow that repository's setup:
+   ```bash
+   git clone https://github.com/yxh-y/TableRAG/ tablerag
+   cd tablerag/offline_data_ingestion_and_query_interface/src
+
+   # MySQL: create a database + user, fill in that project's config, then
+   # ingest your tables (once per benchmark) and start the service:
+   python data_persistent.py --excel_dir $DATA_DIR/hybridqa/dev_excel/
+   python interface.py                            # binds 0.0.0.0:5000
+   ```
+   Then `export SQL_SERVICE_URL=http://127.0.0.1:5000/get_tablerag_response`.
+
+   You can run ATR without the SQL service if you only need the `TEXT` / `RETRIEVE` routes (the router will degrade gracefully).
+4. **(Optional) Official TAT-QA evaluator**, needed only for Recipe B's EM/F1 numbers:
+   ```bash
+   git clone https://github.com/NExTplusplus/TAT-QA <somewhere>/TAT-QA
+   export TATQA_DIR=<somewhere>/TAT-QA
+   ```
+   ATR's own relaxed/EM metric in `atr.evaluate` does not need this.
+
+### Router checkpoint
+
+Train the distilled DistilBERT router yourself with `atr.tools.train_router`
+(step 3 under **Usage**, a few minutes on a single GPU), or point
+`ATR_ROUTER_REPO` at any HuggingFace repo you control and fetch it with:
+
+```bash
+python -m atr.tools.download_router --out_dir ./models/atr_router
+```
+
+A hosted checkpoint will be linked here once it is up.
+
+### Credentials safety
+
+`vertexai.json` (GCP service-account) and any local database config are git-ignored. To get a second line of defence that aborts commits containing those files even if `.gitignore` is bypassed, opt in to the bundled pre-commit hook once:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+### Data
+
+This repository ships no benchmark data. Download each dataset from its
+own release and convert it locally:
+
+| Benchmark            | Upstream                                         | License        |
+|----------------------|--------------------------------------------------|----------------|
+| HybridQA             | https://github.com/wenhuchen/HybridQA            | CC BY-SA 4.0   |
+| TAT-QA               | https://github.com/NExTplusplus/TAT-QA           | MIT            |
+| WikiTableQuestions   | https://ppasupat.github.io/WikiTableQuestions/   | CC BY 4.0      |
+
+```bash
+export DATA_DIR=/path/to/your/data          # used by every command below
+
+# TAT-QA and WTQ need converting into the (excel dir, doc dir, flat json) layout
+python scripts/convert_tatqa.py \
+    --src /path/to/tatqa_dataset_dev.json --out_dir $DATA_DIR
+python scripts/convert_wtq.py \
+    --wtq_dir /path/to/WikiTableQuestions --out_dir $DATA_DIR
+```
+
+That writes `$DATA_DIR/tatqa_excel/`, `$DATA_DIR/tatqa_doc/`,
+`$DATA_DIR/tatqa_dev_flat.json`, `$DATA_DIR/wtq_excel/` and
+`$DATA_DIR/wtq_unseen_flat.json`. HybridQA is already in that layout after
+download. When you report numbers on any of these benchmarks, please cite the
+original paper in addition to ATR.
 
 ## Repository layout
 
 ```
-ATR-release/
+ATR/
 ├── atr/                       # Core package
 │   ├── config.py              # Vertex / OpenAI backbones, default hyperparameters
 │   ├── prompt.py              # All LLM prompts used by ATR
@@ -43,79 +129,7 @@ ATR-release/
 └── .githooks/pre-commit       # Refuses to commit credential files
 ```
 
----
-
-## Install
-
-```bash
-git clone <ANONYMIZED_REPO_URL>.git && cd ATR
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-pip install -e .                  # makes `atr` importable everywhere
-
-python -m atr.smoke               # 7-check install verification (~10 s)
-```
-
-You will also need:
-
-1. **Vertex AI service-account JSON** at `./vertexai.json` (or set `VERTEXAI_CREDENTIALS_PATH`).
-2. **BGE-M3 embedder**: download from HuggingFace and pass the parent directory to `--bge_dir`:
-   ```bash
-   huggingface-cli download BAAI/bge-m3 --local-dir ./models/bge-m3
-   ```
-3. **The Flask SQL service** (for the `SQL` / `HYBRID` primitives). ATR does not
-   ship it. Use the implementation released with TableRAG (Yu et al., EMNLP
-   2025) and follow that repository's setup:
-   ```bash
-   git clone https://github.com/yxh-y/TableRAG/ tablerag
-   cd tablerag/offline_data_ingestion_and_query_interface/src
-
-   # MySQL: create a database + user, fill in that project's config, then
-   # ingest your tables (once per benchmark) and start the service:
-   python data_persistent.py --excel_dir $DATA_DIR/hybridqa/dev_excel/
-   python interface.py                            # binds 0.0.0.0:5000
-   ```
-   Then `export SQL_SERVICE_URL=http://127.0.0.1:5000/get_tablerag_response`.
-
-You can run ATR without the SQL service if you only need the `TEXT` / `RETRIEVE` routes (the router will degrade gracefully).
-
-4. **(Optional) Official TAT-QA evaluator**, needed only for Recipe B's EM/F1 numbers:
-   ```bash
-   git clone https://github.com/NExTplusplus/TAT-QA <somewhere>/TAT-QA
-   export TATQA_DIR=<somewhere>/TAT-QA
-   ```
-   ATR's own relaxed/EM metric in `atr.evaluate` does not need this.
-
-### Pre-trained checkpoints
-
-The distilled DistilBERT router is hosted on the Hugging Face Hub. Download
-it once:
-
-```bash
-python -m atr.tools.download_router \
-    --repo_id <ANONYMIZED>/atr-router-distilbert \
-    --out_dir ./models/atr_router
-```
-
-The checkpoint repo id will be filled in at the camera-ready version.
-For anonymous review, train your own router with `atr.tools.train_router train`
-(see step 3 of the quick start) using the oracle labels shipped under
-`$DATA_DIR/oracle_labels_distill_*.jsonl`, or `export ATR_ROUTER_REPO=<your-fork>`
-to point at any HuggingFace repo you control.
-
-> _Note: the checkpoint repo will be made public at camera-ready time._
-
-### Credentials safety
-
-`vertexai.json` (GCP service-account) and any local database config are git-ignored. To get a second line of defence that aborts commits containing those files even if `.gitignore` is bypassed, opt in to the bundled pre-commit hook once:
-
-```bash
-git config core.hooksPath .githooks
-```
-
----
-
-## Quick start
+## Usage
 
 ### 1. Build the 5-view index
 
@@ -189,45 +203,14 @@ python -m atr.evaluate \
 python scripts/eval_tatqa.py --result_file ./outputs/atr_tatqa.jsonl
 ```
 
----
-
-## Data
-
-This repository ships no benchmark data. Download each dataset from its
-own release and convert it locally:
-
-| Benchmark            | Upstream                                         | License        |
-|----------------------|--------------------------------------------------|----------------|
-| HybridQA             | https://github.com/wenhuchen/HybridQA            | CC BY-SA 4.0   |
-| TAT-QA               | https://github.com/NExTplusplus/TAT-QA           | MIT            |
-| WikiTableQuestions   | https://ppasupat.github.io/WikiTableQuestions/   | CC BY 4.0      |
-
-```bash
-export DATA_DIR=/path/to/your/data          # used by every command below
-
-# TAT-QA and WTQ need converting into the (excel dir, doc dir, flat json) layout
-python scripts/convert_tatqa.py \
-    --src /path/to/tatqa_dataset_dev.json --out_dir $DATA_DIR
-python scripts/convert_wtq.py \
-    --wtq_dir /path/to/WikiTableQuestions --out_dir $DATA_DIR
-```
-
-That writes `$DATA_DIR/tatqa_excel/`, `$DATA_DIR/tatqa_doc/`,
-`$DATA_DIR/tatqa_dev_flat.json`, `$DATA_DIR/wtq_excel/` and
-`$DATA_DIR/wtq_unseen_flat.json`. HybridQA is already in that layout after
-download. When you report numbers on any of these benchmarks, please cite the
-original paper in addition to ATR.
-
----
-
 ## Reproducing the paper
 
 > Headline numbers (Full ATR with Gemini 2.5 Flash, K_max = 5, learned router):
 > **HybridQA dev**: EM 40.83, Relaxed 61.59, token F1 54.02, LLM Judge 54.02.
 
-The recipes below assume you have completed the **Install** section, started
-the SQL service, and downloaded the BGE-M3 embedder and the distilled router
-checkpoint. All commands are run from the repo root.
+The recipes below assume you have completed **Setup**, started the SQL
+service, and downloaded the BGE-M3 embedder and a router checkpoint. All
+commands are run from the repo root.
 
 ### Recipe A. HybridQA dev (Table 1 headline)
 
@@ -314,8 +297,6 @@ for K in 1 3 5 7 10; do
 done
 ```
 
----
-
 ## Acknowledgements
 
 ATR's `SQL` and `HYBRID` primitives execute against the Flask SQL service
@@ -327,3 +308,14 @@ service from its own release. Please cite their paper if you use it.
 The multi-view index is built on **BGE-M3** (Chen et al., 2024) and the
 benchmarks are HybridQA, TAT-QA, and WikiTableQuestions; cite those alongside
 ATR when you report numbers.
+
+## Citation
+
+```bibtex
+@inproceedings{kim2026atr,
+  title     = {Every Answer Has Its Own Path: Agentic Routing for Retrieval-Augmented Table Question Answering},
+  author    = {Kim, A Young and Shin, Jisu and Han, Donghee and Yi, Mun Yong},
+  booktitle = {Proceedings of the 2026 Conference on Empirical Methods in Natural Language Processing},
+  year      = {2026}
+}
+```
