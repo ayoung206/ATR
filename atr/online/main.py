@@ -34,6 +34,30 @@ from atr.online.verifier import EvidenceFusionVerifier                   # noqa:
 
 logger = logging.getLogger(__name__)
 
+
+def _is_valid_answer(answer: Any) -> bool:
+    if answer is None:
+        return False
+    text = str(answer).strip()
+    return bool(text) and text.lower() not in {
+        "none", "null", "n/a", "na", "not found", "error",
+    }
+
+
+def _is_verified_answer(answer: Any, execution_confidence: float) -> bool:
+    """Only verifier-supported, non-empty answers may become final answers."""
+    return execution_confidence == 1.0 and _is_valid_answer(answer)
+
+
+def _should_stop(
+    execution_confidence: float,
+    uncertainty: float,
+    verifier_threshold: float,
+) -> bool:
+    """Paper stop rule: verifier support and residual uncertainty below tau."""
+    return execution_confidence == 1.0 and uncertainty < verifier_threshold
+
+
 def _oracle_match(pred: Any, gold: Any) -> bool:
     """Lenient gold-match for the oracle verifier (upper-bound) ablation.
 
@@ -544,11 +568,11 @@ class AgenticTableRAGAgent:
                 oracle_candidates=oracle_candidates,
             )
 
-            step_failed = not y_t or y_t.strip().lower() in ("not found", "error", "")
+            step_failed = not _is_verified_answer(y_t, c_exec)
             if step_failed:
                 consecutive_failures += 1
                 logger.info(
-                    f"[{question_id}] Step {t} failed (not found). "
+                    f"[{question_id}] Step {t} failed verification or returned no answer. "
                     f"consecutive_failures={consecutive_failures}"
                 )
             else:
@@ -562,48 +586,41 @@ class AgenticTableRAGAgent:
             })
 
             # ── §3.6 Stop Controller ───────────────────────────────────────
-            # Requires BOTH (a) verified execution AND
-            # (b) decomposer uncertainty very low (< 0.1, was 0.2). For
+            # Require BOTH (a) verified execution AND (b) decomposer
+            # uncertainty below the configured paper threshold tau. For
             # multi-hop questions the decomposer often *under*-estimates
             # uncertainty after the first successful step, causing early
             # exit before all bridging sub-queries are resolved. Trust
             # TERMINATE signal (handled above as q_t == TERMINATE break)
             # as the primary stop trigger; this controller is only a
             # secondary safety net for confident terminal answers.
-            if c_exec == 1.0 and sub_q.uncertainty < 0.1:
+            if _should_stop(c_exec, sub_q.uncertainty, self.verifier_threshold):
                 logger.info(
                     f"[{question_id}] Stop Controller: verified + "
-                    f"uncertainty={sub_q.uncertainty:.2f} < 0.10, stopping early"
+                    f"uncertainty={sub_q.uncertainty:.2f} < "
+                    f"{self.verifier_threshold:.2f}, stopping early"
                 )
                 break
 
         # ── Final answer selection (Line 29) ────────────────────────────────
-        def _valid(a: Any) -> bool:
-            if a is None:
-                return False
-            s = str(a).strip()
-            if not s:
-                return False
-            if s.lower() in {"none", "null", "n/a", "na"}:
-                return False
-            return True
-
         # Final Answer Synthesis (multi-hop aggregation only): only
-        # invoke FS when there are multiple sub-answers to fuse; for single-hop
-        # questions FS sometimes overrides a correct intermediate answer.
+        # invoke FS when there are multiple verifier-accepted sub-answers to
+        # fuse. Rejected answers remain in z for decomposition diagnostics but
+        # cannot influence the final answer.
+        accepted_z = [entry for entry in z if not entry.get("failed", False)]
         final_answer: str = ""
-        if self.final_synthesis and len(z) >= 2:
-            synthesized = self._synthesize_final(question, z, question_id)
+        if self.final_synthesis and len(accepted_z) >= 2:
+            synthesized = self._synthesize_final(question, accepted_z, question_id)
             if synthesized:
                 final_answer = synthesized
         # Prefer best_answer (last verified non-failed); fall back through z.
         if not final_answer:
-            if _valid(best_answer):
+            if _is_valid_answer(best_answer):
                 final_answer = best_answer
             else:
-                for entry in reversed(z):
+                for entry in reversed(accepted_z):
                     a = entry.get("answer", "")
-                    if _valid(a):
+                    if _is_valid_answer(a):
                         final_answer = a
                         break
         if not final_answer:

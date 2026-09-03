@@ -168,4 +168,4 @@ RERANK_CANDIDATE_MULTIPLIER: int = int(
 # Online inference settings
 # ──────────────────────────────────────────────────────────────────────────
 MAX_ITER: int = int(os.getenv("AGENTIC_MAX_ITER", "5"))
-VERIFIER_THRESHOLD: float = float(os.getenv("VERIFIER_THRESHOLD", "0.2"))
+VERIFIER_THRESHOLD: float = float(os.getenv("VERIFIER_THRESHOLD", "0.1"))

@@ -167,7 +167,7 @@ Useful flags:
 - `--router_type {heuristic, llm, learned, fixed}`: pick the routing policy.
 - `--force_route HYBRID` (with `--router_type fixed`): ablate to a single primitive.
 - `--no_decomposition`: run the loop on the raw question (collapse to K_max=1).
-- `--verifier_threshold 0.2`: uncertainty cutoff for the stop controller.
+- `--verifier_threshold 0.1`: uncertainty cutoff for the stop controller.
 - `--decomposer_backbone <key>`: drive only the decomposer with another backbone (rest stays on `--backbone`); decomposer-model robustness in Table 4.
 - `--verifier_backbone <key>`: drive only the verifier verdict with another backbone; verifier-model robustness in Table 4.
 - `--oracle_verifier`: upper bound, returning any produced candidate matching the gold, measuring the accuracy ceiling a perfect verifier could reach.
