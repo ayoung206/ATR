@@ -1,7 +1,8 @@
-"""Retrieval-guided constrained SQL: column set C and value bindings V* are injected into the NL query before SQL generation; result is regenerated when no linked value appears in the output."""
+"""Retrieval-guided SQL with fail-closed structural constraint validation."""
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from atr.online.value_linker import LinkedValue, build_value_bindings_text
@@ -46,52 +47,137 @@ def _execution_confidence(sql_result: str) -> float:
         return 0.3
     return 1.0
 
-def _has_mismatch(
-    sql_result: str,
+def _normalise_identifier(value: Any) -> str:
+    text = str(value or "").strip().strip("`\"'").lower()
+    text = re.sub(r"\.(xlsx|xls|csv)$", "", text)
+    return re.sub(r"[\s\-]+", "_", text)
+
+
+def _schema_columns(schema: Optional[Dict[str, Any]]) -> List[str]:
+    columns: List[str] = []
+    for entry in (schema or {}).get("columns", []) or []:
+        if isinstance(entry, dict):
+            name = entry.get("col_name") or entry.get("name")
+        elif isinstance(entry, (list, tuple)) and entry:
+            name = entry[0]
+        else:
+            name = entry
+        if name:
+            columns.append(str(name))
+    return columns
+
+
+def _clean_sql(sql: str) -> str:
+    text = str(sql or "").strip()
+    text = re.sub(r"^```(?:sql)?\s*", "", text, flags=re.IGNORECASE)
+    return re.sub(r"\s*```$", "", text).strip()
+
+
+def validate_sql_constraints(
+    sql: str,
+    allowed_columns: List[str],
+    allowed_tables: List[str],
     linked_values: List[LinkedValue],
-    retrieval_evidence: str,
-) -> bool:
-    """
-    Principle (4): detect result-evidence conflict.
+) -> List[str]:
+    """Return violations of ``C``/``V*``; empty means admissible SQL."""
+    sql = _clean_sql(sql)
+    if not sql:
+        return ["SQL service did not return sql_str"]
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:
+        return ["sqlglot is required for strict SQL constraint validation"]
 
-    A mismatch is flagged when:
-      - Linked values are available AND none of their surface forms appear
-        in the SQL result (wrong table / wrong column binding).
-      - OR the SQL result is empty while retrieval evidence contains data
-        (suggests the query hit the wrong place).
+    try:
+        statements = [s for s in sqlglot.parse(sql, read="mysql") if s is not None]
+    except Exception as exc:
+        return [f"SQL parse failed: {exc}"]
+    if len(statements) != 1:
+        return ["exactly one SQL statement is required"]
+    tree = statements[0]
+    if not isinstance(tree, exp.Query) or tree.find(exp.Into):
+        return ["only one read-only SELECT query is allowed"]
 
-    Returns True if the result should be retried.
-    """
-    # Only check when SQL returned something non-trivial
-    if not sql_result or sql_result.strip() in ("[]", "{}", ""):
-        return False
+    violations: List[str] = []
+    allowed_column_set = {_normalise_identifier(c) for c in allowed_columns}
+    allowed_table_set = {_normalise_identifier(t) for t in allowed_tables if t}
+    cte_names = {
+        _normalise_identifier(cte.alias_or_name) for cte in tree.find_all(exp.CTE)
+    }
+    used_tables = {
+        _normalise_identifier(table.name)
+        for table in tree.find_all(exp.Table)
+        if _normalise_identifier(table.name) not in cte_names
+    }
+    disallowed_tables = sorted(used_tables - allowed_table_set)
+    if disallowed_tables:
+        violations.append(f"disallowed tables: {', '.join(disallowed_tables)}")
 
-    matched_values = [
-        lv.matched_value for lv in linked_values
-        if lv.is_matched and lv.matched_value
-    ]
-    if not matched_values:
-        return False
+    aliases = {
+        _normalise_identifier(selection.alias)
+        for select in tree.find_all(exp.Select)
+        for selection in select.expressions
+        if selection.alias
+    }
+    used_columns = {
+        _normalise_identifier(column.name)
+        for column in tree.find_all(exp.Column)
+        if column.name != "*"
+    }
+    disallowed_columns = sorted(used_columns - allowed_column_set - aliases)
+    if disallowed_columns:
+        violations.append(f"disallowed columns: {', '.join(disallowed_columns)}")
 
-    sql_lower = sql_result.lower()
-    any_present = any(v.lower() in sql_lower for v in matched_values)
-    if not any_present:
-        logger.debug(
-            f"Mismatch: linked values {matched_values} absent from SQL result"
-        )
-        return True
+    stars = list(tree.find_all(exp.Star))
+    if any(star.find_ancestor(exp.Count) is None for star in stars):
+        violations.append("SELECT * is not allowed")
+    if not (used_columns & allowed_column_set) and not stars:
+        violations.append("query does not reference an allowed column")
 
-    return False
+    where_nodes = list(tree.find_all(exp.Where))
+    for linked in linked_values:
+        if not linked.is_matched or linked.matched_value is None:
+            continue
+        wanted_column = _normalise_identifier(linked.column)
+        wanted_value = str(linked.matched_value)
+        binding_found = False
+        for where in where_nodes:
+            for predicate in where.find_all(exp.Predicate):
+                predicate_columns = {
+                    _normalise_identifier(column.name)
+                    for column in predicate.find_all(exp.Column)
+                }
+                literal_values = [
+                    str(literal.this) for literal in predicate.find_all(exp.Literal)
+                ]
+                if wanted_column not in predicate_columns:
+                    continue
+                if wanted_value in literal_values:
+                    binding_found = True
+                    break
+                if linked.fallback_level == 2 and any(
+                    wanted_value in literal.strip("%") for literal in literal_values
+                ):
+                    binding_found = True
+                    break
+            if binding_found:
+                break
+        if not binding_found:
+            violations.append(
+                f"missing exact WHERE binding: {linked.column}={wanted_value!r}"
+            )
+    return violations
 
 class ConstrainedSQLExecutor:
     """
     §3.5  Retrieval-Guided Constrained SQL Executor.
 
     Wraps the Flask SQL service (get_excel_rag_response_plain) with:
-      - Column constraint injection into the query text        (Principle 1)
-      - Value constraint injection (grounded WHERE conditions) (Principle 2)
+      - Column constraint injection and AST enforcement        (Principle 1)
+      - Value binding injection and WHERE enforcement           (Principle 2)
       - Table context from restored schema                     (Principle 3)
-      - Automatic retry on empty result or evidence mismatch   (Principle 4)
+      - Fail-closed repair on invalid SQL or empty execution    (Principle 4)
     """
 
     def __init__(
@@ -119,12 +205,33 @@ class ConstrainedSQLExecutor:
                                 table name context into the query
             allowed_columns:    column entries from Schema Index (View 3)
             linked_values:      grounded value bindings V* from Constrained Value Linking
-            retrieval_evidence: schema/cell evidence text, used for mismatch detection
+            retrieval_evidence: schema/cell evidence text supplied to SQL generation
 
         Returns:
             (sql_execution_result, execution_confidence)
         """
-        col_names = [c["col_name"] for c in allowed_columns]
+        col_names = [str(c["col_name"]) for c in allowed_columns if c.get("col_name")]
+        if not col_names:
+            col_names = _schema_columns(schema)
+        col_names = list(dict.fromkeys(col_names))
+        if not col_names:
+            logger.warning("ConstrainedSQL: refusing execution without column constraint C")
+            return "not found", 0.0
+
+        allowed_tables = [
+            str(c.get("table_id") or c.get("table_name") or c.get("source"))
+            for c in allowed_columns
+            if c.get("table_id") or c.get("table_name") or c.get("source")
+        ]
+        if schema and schema.get("table_name"):
+            allowed_tables.append(str(schema["table_name"]))
+        if not allowed_tables:
+            allowed_tables = list(self.table_name_list)
+        allowed_tables = list(dict.fromkeys(allowed_tables))
+        if not allowed_tables:
+            logger.warning("ConstrainedSQL: refusing execution without a table constraint")
+            return "not found", 0.0
+
         value_bindings_text = build_value_bindings_text(linked_values)
 
         # Principle 3: inject table name from restored schema (View 2)
@@ -134,18 +241,18 @@ class ConstrainedSQLExecutor:
 
         answer_type_hint = _infer_answer_type(sub_query)
 
-        def _build_query(value_bindings: str) -> str:
+        def _build_query(repair: str = "") -> str:
             evidence_snippet = retrieval_evidence[:800] if retrieval_evidence else "(none)"
             base = CONSTRAINED_SQL_QUERY_TEMPLATE.format(
                 original_query=sub_query,
                 allowed_columns=", ".join(col_names) if col_names else "(all)",
-                value_bindings=value_bindings,
+                value_bindings=value_bindings_text,
                 answer_type_hint=answer_type_hint,
                 text_evidence=evidence_snippet,
             )
-            return base + table_context
+            return base + table_context + repair
 
-        enriched_query = _build_query(value_bindings_text)
+        enriched_query = _build_query()
         sql_result = ""
 
         for attempt in range(1, self.max_retries + 1):
@@ -154,6 +261,26 @@ class ConstrainedSQLExecutor:
                 query=enriched_query,
             )
             sql_result = str(response.get("sql_execution_result", ""))
+            sql_str = str(response.get("sql_str", ""))
+            violations = validate_sql_constraints(
+                sql_str,
+                allowed_columns=col_names,
+                allowed_tables=allowed_tables,
+                linked_values=linked_values,
+            )
+            if violations:
+                logger.warning(
+                    "ConstrainedSQL rejected generated SQL: %s",
+                    "; ".join(violations),
+                )
+                if attempt < self.max_retries:
+                    enriched_query = _build_query(
+                        "\n\nSTRICT CONSTRAINT REPAIR REQUIRED\n"
+                        f"Rejected SQL: {_clean_sql(sql_str)}\n"
+                        f"Violations: {'; '.join(violations)}\n"
+                        "Generate a new SQL query without relaxing C or V*."
+                    )
+                continue
             c_exec = _execution_confidence(sql_result)
 
             logger.debug(
@@ -161,30 +288,17 @@ class ConstrainedSQLExecutor:
                 f"c_exec={c_exec:.2f}, result={str(sql_result)[:120]}"
             )
 
-            if c_exec == 0.0:
-                # Principle (4) retry path A: empty / parse error
+            if c_exec != 1.0:
                 if attempt < self.max_retries:
                     logger.info(
-                        f"ConstrainedSQL: empty/failed result, relaxing value "
-                        f"constraint (attempt {attempt}/{self.max_retries})"
+                        f"ConstrainedSQL: empty/failed result, retrying without "
+                        f"relaxing constraints (attempt {attempt}/{self.max_retries})"
                     )
                     enriched_query = _build_query(
-                        "(unconstrained — retry after empty result)"
+                        "\n\nExecution was empty or failed. Generate a different "
+                        "query that still satisfies every constraint above."
                     )
                 continue
-
-            # Principle (4) retry path B: result-evidence mismatch
-            if _has_mismatch(sql_result, linked_values, retrieval_evidence):
-                if attempt < self.max_retries:
-                    logger.info(
-                        f"ConstrainedSQL: result-evidence mismatch detected, "
-                        f"retrying with relaxed value constraint "
-                        f"(attempt {attempt}/{self.max_retries})"
-                    )
-                    enriched_query = _build_query(
-                        "(unconstrained — retry after mismatch)"
-                    )
-                    continue
 
             return sql_result, c_exec
 

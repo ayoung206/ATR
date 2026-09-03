@@ -15,8 +15,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from tqdm import tqdm
 
 from atr.clients.chat_utils import get_chat_result, init_logger                   # noqa: E402
-from atr.clients.sql_tool import get_excel_rag_response_plain               # noqa: E402
-
 from atr.config import (  # noqa: E402
     config_mapping,
     MAX_ITER,
@@ -848,23 +846,26 @@ class AgenticTableRAGAgent:
                 enable_schema_hint=True,
                 enable_type_hint=True,
             )
-            resp = get_excel_rag_response_plain(
-                table_name_list=sql_executor.table_name_list,
-                query=augmented_query,
+            schema_evidence = _schema_entries_to_text(C_sql)
+            sql_result, _ = sql_executor.execute(
+                sub_query=augmented_query,
+                schema=schema,
+                allowed_columns=C_sql,
+                linked_values=[],
+                retrieval_evidence=schema_evidence,
             )
-            sql_result = str(resp.get("sql_execution_result", ""))
             y_t = self.verifier.fuse(
                 sub_query=sub_q.sub_query,
                 original_question=original_question,
                 route=route.value,
                 text_evidence=text_evidence,
-                schema_cell_evidence="",
+                schema_cell_evidence=schema_evidence,
                 sql_result=sql_result,
                 expected_operator=sub_q.expected_operator,
                 table_chunks_md=_table_chunks_to_markdown(chunks),
                 legacy_fast_path=self.legacy_fast_path,
             )
-            return y_t, sql_result, schema_cell_ev
+            return y_t, sql_result, schema_evidence
 
         # ── RETRIEVE / HYBRID: Schema + Cell retrieval first ─────────────────
         C, V_raw = self.index.schema_cell_retrieval(

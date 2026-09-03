@@ -266,8 +266,9 @@ SQL generation rules:
   1. Refer only to the allowed columns listed above.
   2. If a value binding is provided for a column, use the exact bound value in the
      WHERE clause (do not paraphrase or look up alternatives).
-  3. If value_bindings is "(none)" or "(unconstrained ...)", generate the most
-     plausible WHERE clause you can from the query text alone, or omit WHERE if uncertain.
+  3. If value_bindings is "(none)", generate the most plausible WHERE clause
+     from the query text alone, or omit WHERE if uncertain. If bindings are
+     present, every binding is mandatory and must never be relaxed on retry.
   4. Use the retrieval evidence to understand actual column names, data formats, and
      example values — do not hallucinate column names not present in the evidence.
   5. SELECT EXACTLY ONE result: return only the single column/value that directly
@@ -278,7 +279,8 @@ SQL generation rules:
        diff → ABS(year_a - year_b)
        rank → ORDER BY ... LIMIT 1
      Never leave arithmetic to post-processing when SQL can compute it directly.
-  7. Use standard SQL syntax compatible with MySQL 8.
+  7. Emit exactly one read-only SELECT statement for the target table, using
+     standard SQL syntax compatible with MySQL 8.
 """
 
 # ---------------------------------------------------------------------------

@@ -48,6 +48,12 @@ python -m atr.smoke               # 5-check install verification (~10 s)
    ```
    Then `export SQL_SERVICE_URL=http://127.0.0.1:5000/get_tablerag_response`.
 
+   ATR validates every returned SQL statement with an AST gate before using
+   its result: only one read-only `SELECT` is accepted, referenced tables and
+   columns must belong to the retrieved constraints, and every grounded
+   value binding must occur in its column's `WHERE` predicate. Invalid SQL is
+   repaired without relaxing `C` or `V*`; exhausted repairs fail closed.
+
    You can run ATR without the SQL service if you only need the `TEXT` / `RETRIEVE` routes (the router will degrade gracefully).
 4. **(Optional) Official TAT-QA evaluator**, needed only for Recipe B's EM/F1 numbers:
    ```bash
