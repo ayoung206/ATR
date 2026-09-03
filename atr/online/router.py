@@ -279,22 +279,10 @@ class LearnedRouter(BaseRouter):
         # rather than a fixed global chain.
         self._last_logits = logits
 
-        # Phase G+ (Priority 3): remap predicted RETRIEVE to HYBRID at inference.
-        # Rationale: cell-only RETRIEVE primitive has ~1% standalone V=1 rate
-        # (cf. tools/train_router.py distill labels: RETRIEVE = 68% of HybridQA
-        # train labels). HYBRID already includes the same value-linking step,
-        # so remapping RETRIEVE -> HYBRID preserves the LLM-router intent
-        # without sending sub-queries down the broken standalone path.
-        # Set ATR_KEEP_RETRIEVE=1 to keep the raw RETRIEVE choice instead.
-        import os
-        remap_retrieve = os.environ.get("ATR_KEEP_RETRIEVE", "0") != "1"
-
         # Pick highest-scoring non-failed route
         order = logits.argsort(descending=True).tolist()
         for idx in order:
             candidate = self.LABEL2ROUTE[idx]
-            if remap_retrieve and candidate == Route.RETRIEVE:
-                candidate = Route.HYBRID
             if candidate.value not in failed_routes:
                 logger.debug(f"LearnedRouter → {candidate} (logit={logits[idx]:.3f})")
                 return candidate
