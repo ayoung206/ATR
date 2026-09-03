@@ -17,7 +17,14 @@ from tqdm import tqdm
 from atr.clients.chat_utils import get_chat_result, init_logger                   # noqa: E402
 from atr.clients.sql_tool import get_excel_rag_response_plain               # noqa: E402
 
-from atr.config import config_mapping, MAX_ITER, SCHEMA_TOP_K, CELL_TOP_K, VERIFIER_THRESHOLD  # noqa: E402
+from atr.config import (  # noqa: E402
+    config_mapping,
+    MAX_ITER,
+    SCHEMA_TOP_K,
+    CELL_TOP_K,
+    VERIFIER_THRESHOLD,
+    RERANK_CANDIDATE_MULTIPLIER,
+)
 from atr.offline.multiview_index import MultiviewIndex                      # noqa: E402
 from atr.online.decomposer import QueryDecomposer, SubQuery              # noqa: E402
 from atr.online.router import build_router, Route                           # noqa: E402
@@ -1007,7 +1014,20 @@ if __name__ == "__main__":
     parser.add_argument("--index_path", type=str, required=True,
                         help="Path prefix for the saved MultiviewIndex (from build_index.py)")
     parser.add_argument("--bge_dir", type=str, default="BAAI",
-                        help="Directory containing bge-m3 model")
+                        help="Directory containing bge-m3 and bge-reranker-v2-m3")
+    parser.add_argument(
+        "--reranker_path", type=str, default=None,
+        help="Cross-encoder model path (default: <bge_dir>/bge-reranker-v2-m3)",
+    )
+    parser.add_argument(
+        "--rerank_candidate_multiplier", type=int,
+        default=RERANK_CANDIDATE_MULTIPLIER,
+        help="Dense candidates recalled per result before cross-encoder reranking",
+    )
+    parser.add_argument(
+        "--no_reranker", action="store_true",
+        help="Ablation/debug only: disable the BGE cross-encoder reranker",
+    )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--require_cuda", action="store_true")
     parser.add_argument("--max_iter", type=int, default=MAX_ITER)
@@ -1100,6 +1120,9 @@ if __name__ == "__main__":
         bge_model_path=bge_model_path,
         device=args.device,
         require_cuda=args.require_cuda,
+        reranker_model_path=args.reranker_path,
+        enable_reranker=not args.no_reranker,
+        rerank_candidate_multiplier=args.rerank_candidate_multiplier,
     )
 
     agent = AgenticTableRAGAgent(

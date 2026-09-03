@@ -28,9 +28,11 @@ python -m atr.smoke               # 5-check install verification (~10 s)
 ### External dependencies
 
 1. **Vertex AI service-account JSON** at `./vertexai.json` (or set `VERTEXAI_CREDENTIALS_PATH`).
-2. **BGE-M3 embedder**: download from HuggingFace and pass the parent directory to `--bge_dir`:
+2. **BGE-M3 embedder and BGE-reranker-v2-M3 cross-encoder**: download both
+   from HuggingFace and pass their parent directory to `--bge_dir`:
    ```bash
    huggingface-cli download BAAI/bge-m3 --local-dir ./models/bge-m3
+   huggingface-cli download BAAI/bge-reranker-v2-m3 --local-dir ./models/bge-reranker-v2-m3
    ```
 3. **The Flask SQL service** (for the `SQL` / `HYBRID` primitives). ATR does not
    ship it. Use the implementation released with TableRAG (Yu et al., EMNLP
@@ -142,7 +144,10 @@ python -m atr.build_index \
     --budget    10000
 ```
 
-`<bge_dir>/bge-m3/` must contain the BGE-M3 weights.
+Index construction only needs `<bge_dir>/bge-m3/`. Online retrieval recalls
+six times the requested result count with BGE-M3, then reranks the candidates
+for Views 1--4 with `<bge_dir>/bge-reranker-v2-m3/`. Existing indices do not
+need rebuilding.
 
 ### 2. Run online inference (Algorithm 1)
 
@@ -166,6 +171,9 @@ Useful flags:
 - `--decomposer_backbone <key>`: drive only the decomposer with another backbone (rest stays on `--backbone`); decomposer-model robustness in Table 4.
 - `--verifier_backbone <key>`: drive only the verifier verdict with another backbone; verifier-model robustness in Table 4.
 - `--oracle_verifier`: upper bound, returning any produced candidate matching the gold, measuring the accuracy ceiling a perfect verifier could reach.
+- `--reranker_path <path>`: use a reranker checkpoint outside `<bge_dir>`.
+- `--rerank_candidate_multiplier 6`: dense candidate pool size per final result.
+- `--no_reranker`: disable cross-encoder reranking for an explicit ablation.
 
 ### 3. Train the learned router
 

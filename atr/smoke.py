@@ -29,7 +29,7 @@ def _check_imports() -> Tuple[bool, str]:
         "atr.config", "atr.prompt", "atr.build_index", "atr.evaluate",
         "atr.online.main", "atr.online.decomposer", "atr.online.router",
         "atr.online.value_linker", "atr.online.constrained_sql", "atr.online.verifier",
-        "atr.offline.multiview_index",
+        "atr.offline.multiview_index", "atr.offline.reranking",
         "atr.clients.chat_utils", "atr.clients.sql_tool",
         "atr.clients.tool_utils",
         "atr.baselines.naive_llm", "atr.baselines.naiverag",

@@ -160,6 +160,9 @@ sql_service_url: str = os.getenv("SQL_SERVICE_URL", "").strip()
 CELL_INDEX_BUDGET: int = int(os.getenv("CELL_INDEX_BUDGET", "10000"))
 SCHEMA_TOP_K: int = int(os.getenv("SCHEMA_TOP_K", "5"))
 CELL_TOP_K: int = int(os.getenv("CELL_TOP_K", "15"))   # K = 10–20 (§3.5)
+RERANK_CANDIDATE_MULTIPLIER: int = int(
+    os.getenv("RERANK_CANDIDATE_MULTIPLIER", "6")
+)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Online inference settings

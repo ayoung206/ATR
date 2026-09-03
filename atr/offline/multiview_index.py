@@ -12,10 +12,56 @@ import faiss
 import numpy as np
 import pandas as pd
 
-from atr.clients.tool_utils import Embedder, excel_to_markdown  # noqa: E402
+from atr.clients.tool_utils import Embedder, Reranker, excel_to_markdown  # noqa: E402
+from atr.offline.reranking import CrossEncoderCandidateReranker  # noqa: E402
 from langchain_text_splitters import RecursiveCharacterTextSplitter  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+def _schema_entry_to_text(entry: Dict[str, Any]) -> str:
+    return (
+        f"column: {entry['col_name']} | type: {entry['dtype']} | "
+        f"examples: {entry['examples']}"
+    )
+
+
+def _cell_entry_to_text(entry: Dict[str, Any]) -> str:
+    return f"column: {entry['col_name']} | value: {entry['value']}"
+
+
+def _default_reranker_path(bge_model_path: str) -> str:
+    return os.path.join(os.path.dirname(bge_model_path), "bge-reranker-v2-m3")
+
+
+def _load_reranker(
+    model_path: str,
+    device: str,
+    require_cuda: bool,
+    candidate_multiplier: int,
+) -> CrossEncoderCandidateReranker:
+    if candidate_multiplier < 1:
+        raise ValueError("rerank candidate multiplier must be at least 1")
+    logger.info(
+        "Loading cross-encoder reranker from %s (candidate multiplier=%d)",
+        model_path,
+        candidate_multiplier,
+    )
+    try:
+        backend = Reranker(
+            model_name_or_path=model_path,
+            device=device,
+            require_cuda=require_cuda,
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Unable to load BGE reranker from {model_path!r}. Download "
+            "BAAI/bge-reranker-v2-m3 there, pass --reranker_path, or use "
+            "--no_reranker only for an explicit ablation."
+        ) from exc
+    return CrossEncoderCandidateReranker(
+        backend, candidate_multiplier=candidate_multiplier
+    )
 
 def _load_dataframe(file_path: str) -> Optional[pd.DataFrame]:
     """Load a CSV or Excel file into a pandas DataFrame."""
@@ -43,11 +89,16 @@ def _extract_schema(df: pd.DataFrame, table_name: str) -> Dict[str, Any]:
 class SchemaIndex:
     """
     View 3: Schema Index (§3.2)
-    Per-column embeddings for "which column is relevant?" retrieval.
+    Per-column dense recall followed by cross-encoder reranking.
     """
 
-    def __init__(self, embedder: Embedder) -> None:
+    def __init__(
+        self,
+        embedder: Embedder,
+        reranker: Optional[CrossEncoderCandidateReranker] = None,
+    ) -> None:
         self.embedder = embedder
+        self.reranker = reranker
         self.entries: List[Dict[str, Any]] = []  # [{table_id, col_name, dtype, examples}]
         self._index: Optional[faiss.IndexFlatIP] = None
         self._embeddings: Optional[np.ndarray] = None
@@ -64,10 +115,7 @@ class SchemaIndex:
     def build(self) -> None:
         if not self.entries:
             return
-        texts = [
-            f"column: {e['col_name']} | type: {e['dtype']} | examples: {e['examples']}"
-            for e in self.entries
-        ]
+        texts = [_schema_entry_to_text(e) for e in self.entries]
         self._embeddings = self._embed_in_batches(texts)
         dim = self._embeddings.shape[1]
         self._index = faiss.IndexFlatIP(dim)
@@ -79,8 +127,17 @@ class SchemaIndex:
             return []
         q_emb = self.embedder.encode([query]).astype(np.float32)
         top_k = min(top_k, len(self.entries))
-        _, I = self._index.search(q_emb, top_k)
-        return [self.entries[i] for i in I[0] if i < len(self.entries)]
+        search_k = (
+            self.reranker.recall_size(top_k, len(self.entries))
+            if self.reranker else top_k
+        )
+        _, I = self._index.search(q_emb, search_k)
+        candidates = [self.entries[i] for i in I[0] if 0 <= i < len(self.entries)]
+        if not self.reranker:
+            return candidates[:top_k]
+        return self.reranker.select(
+            query, candidates, [_schema_entry_to_text(e) for e in candidates], top_k
+        )
 
     def _embed_in_batches(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
         vecs = []
@@ -91,7 +148,7 @@ class SchemaIndex:
 class CellIndex:
     """
     View 4: Cell / Row Index (§3.2), a new contribution.
-    Cell component: (column, value) pair embeddings with budget-B
+    Cell component: (column, value) pair dense recall + cross-encoder reranking with budget-B
     frequency-aware truncation. Directly supports Constrained Value Linking
     Stage 1 (§3.5). The row component is implemented separately as
     `RowIndex` and registered under the same View 4 conceptual umbrella
@@ -104,6 +161,7 @@ class CellIndex:
         embedder: Embedder,
         budget: int = 200_000,
         per_table_quota: int = 50,
+        reranker: Optional[CrossEncoderCandidateReranker] = None,
     ) -> None:
         """
         Args:
@@ -116,6 +174,7 @@ class CellIndex:
                               with zero coverage.
         """
         self.embedder = embedder
+        self.reranker = reranker
         self.budget = budget
         self.per_table_quota = per_table_quota
         self.entries: List[Dict[str, Any]] = []  # [{table_id, col_name, value, freq}]
@@ -147,10 +206,7 @@ class CellIndex:
     def build(self) -> None:
         if not self.entries:
             return
-        texts = [
-            f"column: {e['col_name']} | value: {e['value']}"
-            for e in self.entries
-        ]
+        texts = [_cell_entry_to_text(e) for e in self.entries]
         embeddings = self._embed_in_batches(texts)
         dim = embeddings.shape[1]
         self._index = faiss.IndexFlatIP(dim)
@@ -172,8 +228,17 @@ class CellIndex:
         query_text = f"column: {column} | {entity}" if column else entity
         q_emb = self.embedder.encode([query_text]).astype(np.float32)
         top_k = min(top_k, len(self.entries))
-        _, I = self._index.search(q_emb, top_k)
-        return [self.entries[i] for i in I[0] if i < len(self.entries)]
+        search_k = (
+            self.reranker.recall_size(top_k, len(self.entries))
+            if self.reranker else top_k
+        )
+        _, I = self._index.search(q_emb, search_k)
+        candidates = [self.entries[i] for i in I[0] if 0 <= i < len(self.entries)]
+        if not self.reranker:
+            return candidates[:top_k]
+        return self.reranker.select(
+            query_text, candidates, [_cell_entry_to_text(e) for e in candidates], top_k
+        )
 
     def _embed_in_batches(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
         vecs = []
@@ -185,7 +250,7 @@ class RowIndex:
     """
     View 4 row component: RowIndex (§3.2, Phase F-A).
 
-    Per-row text embeddings, indexed for entity-aware retrieval.
+    Per-row text embeddings, indexed for entity-aware dense recall and reranking.
     Closes the standalone-V=1 gap of the RETRIEVE primitive by giving the
     LLM specific table rows (not whole table chunks) so it can locate the
     target column for a filtered entity.
@@ -202,8 +267,10 @@ class RowIndex:
         budget: int = 500_000,
         per_table_quota: int = 100,
         max_row_chars: int = 600,
+        reranker: Optional[CrossEncoderCandidateReranker] = None,
     ) -> None:
         self.embedder = embedder
+        self.reranker = reranker
         self.budget = budget
         self.per_table_quota = per_table_quota
         self.max_row_chars = max_row_chars
@@ -257,21 +324,30 @@ class RowIndex:
         if self._index is None or len(self.entries) == 0:
             return []
         q_emb = self.embedder.encode([query]).astype(np.float32)
-        # Over-fetch when filtering by table_id so we still get top_k hits
-        search_k = min(len(self.entries), top_k * (10 if table_id else 1))
+        candidate_k = (
+            self.reranker.recall_size(top_k, len(self.entries))
+            if self.reranker else min(top_k, len(self.entries))
+        )
+        # Over-fetch when filtering by table_id so enough in-table candidates
+        # remain for the cross-encoder.
+        search_k = min(len(self.entries), candidate_k * (10 if table_id else 1))
         _, I = self._index.search(q_emb, search_k)
 
-        out = []
+        candidates = []
         for i in I[0]:
             if i < 0 or i >= len(self.entries):
                 continue
             e = self.entries[i]
             if table_id is not None and e["table_id"] != table_id:
                 continue
-            out.append(e)
-            if len(out) >= top_k:
+            candidates.append(e)
+            if len(candidates) >= candidate_k:
                 break
-        return out
+        if not self.reranker:
+            return candidates[:top_k]
+        return self.reranker.select(
+            query, candidates, [e["row_text"] for e in candidates], top_k
+        )
 
     def _embed_in_batches(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
         vecs = []
@@ -282,7 +358,7 @@ class RowIndex:
 class DocumentRetriever:
     """
     Views 1 & 2 combined.
-    View 1 (Text Chunks): T and D̂ (markdown table) chunking + dense embedding.
+    View 1 (Text Chunks): T and D̂ (markdown table) dense recall + reranking.
     View 2 (Table Chunks): maintains mapping f: chunk_idx → (table_id, schema).
     """
 
@@ -291,8 +367,10 @@ class DocumentRetriever:
         embedder: Embedder,
         chunk_size: int = 1000,
         chunk_overlap: int = 200,
+        reranker: Optional[CrossEncoderCandidateReranker] = None,
     ) -> None:
         self.embedder = embedder
+        self.reranker = reranker
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size, chunk_overlap=chunk_overlap
         )
@@ -354,7 +432,11 @@ class DocumentRetriever:
             return []
         q_emb = self.embedder.encode([query]).astype(np.float32)
         top_k = min(top_k, len(self.chunks))
-        _, I = self._index.search(q_emb, top_k)
+        search_k = (
+            self.reranker.recall_size(top_k, len(self.chunks))
+            if self.reranker else top_k
+        )
+        _, I = self._index.search(q_emb, search_k)
         results = []
         for i in I[0]:
             if i >= len(self.chunks):
@@ -368,7 +450,11 @@ class DocumentRetriever:
                 entry["table_id"] = self.chunk_schema_map[i]["table_id"]
                 entry["schema"] = self.chunk_schema_map[i]["schema"]
             results.append(entry)
-        return results
+        if not self.reranker:
+            return results[:top_k]
+        return self.reranker.select(
+            query, results, [entry["text"] for entry in results], top_k
+        )
 
     def restore_schema_via_mapping(
         self, chunks: List[Dict[str, Any]]
@@ -412,6 +498,8 @@ class MultiviewIndex:
         per_table_quota: int = 50,
         device: str = "auto",
         require_cuda: bool = False,
+        reranker_model_path: Optional[str] = None,
+        rerank_candidate_multiplier: int = 6,
     ) -> None:
         self.excel_dir = excel_dir
         self.doc_dir = doc_dir
@@ -421,18 +509,29 @@ class MultiviewIndex:
         self.per_table_quota = per_table_quota
 
         self.embedder = Embedder(bge_model_path, device=device, require_cuda=require_cuda)
-        self.doc_retriever = DocumentRetriever(self.embedder)
-        self.schema_index = SchemaIndex(self.embedder)
+        self.reranker = (
+            _load_reranker(
+                reranker_model_path,
+                device,
+                require_cuda,
+                rerank_candidate_multiplier,
+            )
+            if reranker_model_path else None
+        )
+        self.doc_retriever = DocumentRetriever(self.embedder, reranker=self.reranker)
+        self.schema_index = SchemaIndex(self.embedder, reranker=self.reranker)
         self.cell_index = CellIndex(
             self.embedder,
             budget=budget,
             per_table_quota=per_table_quota,
+            reranker=self.reranker,
         )
         # Phase F-A: View 4 (row component), Row Index (per-row embeddings for RETRIEVE)
         self.row_index = RowIndex(
             self.embedder,
             budget=max(budget, 500_000),
             per_table_quota=max(per_table_quota, 100),
+            reranker=self.reranker,
         )
 
         # table_id → schema (for SQL-route schema lookup)
@@ -620,19 +719,34 @@ class MultiviewIndex:
         bge_model_path: str,
         device: str = "auto",
         require_cuda: bool = False,
+        reranker_model_path: Optional[str] = None,
+        enable_reranker: bool = True,
+        rerank_candidate_multiplier: int = 6,
     ) -> "MultiviewIndex":
         with open(save_path + ".meta.pkl", "rb") as f:
             payload = pickle.load(f)
 
         embedder = Embedder(bge_model_path, device=device, require_cuda=require_cuda)
+        reranker = None
+        if enable_reranker:
+            resolved_reranker_path = (
+                reranker_model_path or _default_reranker_path(bge_model_path)
+            )
+            reranker = _load_reranker(
+                resolved_reranker_path,
+                device,
+                require_cuda,
+                rerank_candidate_multiplier,
+            )
 
         instance = cls.__new__(cls)
         instance.embedder = embedder
+        instance.reranker = reranker
         instance.save_path = save_path
         instance.table_schemas = payload["table_schemas"]
 
         # Restore DocumentRetriever (Views 1+2)
-        dr = DocumentRetriever(embedder)
+        dr = DocumentRetriever(embedder, reranker=reranker)
         dr.chunks = payload["doc_chunks"]
         dr.chunk_source = payload["doc_source"]
         dr.chunk_type = payload["doc_type"]
@@ -643,7 +757,7 @@ class MultiviewIndex:
         instance.doc_retriever = dr
 
         # Restore SchemaIndex (View 3)
-        si = SchemaIndex(embedder)
+        si = SchemaIndex(embedder, reranker=reranker)
         si.entries = payload["schema_entries"]
         schema_faiss_path = save_path + ".schema.faiss"
         if os.path.exists(schema_faiss_path):
@@ -651,7 +765,7 @@ class MultiviewIndex:
         instance.schema_index = si
 
         # Restore CellIndex (View 4)
-        ci = CellIndex(embedder)
+        ci = CellIndex(embedder, reranker=reranker)
         ci.entries = payload["cell_entries"]
         cell_faiss_path = save_path + ".cell.faiss"
         if os.path.exists(cell_faiss_path):
@@ -659,13 +773,16 @@ class MultiviewIndex:
         instance.cell_index = ci
 
         # Restore RowIndex (View 4 (row component), Phase F-A; backward-compatible if absent)
-        ri = RowIndex(embedder)
+        ri = RowIndex(embedder, reranker=reranker)
         ri.entries = payload.get("row_entries", [])
         row_faiss_path = save_path + ".row.faiss"
         if os.path.exists(row_faiss_path):
             ri._index = faiss.read_index(row_faiss_path)
         instance.row_index = ri
 
-        logger.info(f"MultiviewIndex loaded from {save_path}.* "
-                    f"(row entries: {len(ri.entries)})")
+        logger.info(
+            f"MultiviewIndex loaded from {save_path}.* "
+            f"(row entries: {len(ri.entries)}, reranker: "
+            f"{'enabled' if reranker else 'disabled'})"
+        )
         return instance

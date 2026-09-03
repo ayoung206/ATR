@@ -66,6 +66,7 @@ def main():
         bge_model_path=args.bge_dir,
         device=args.device,
         require_cuda=(args.device == "cuda"),
+        enable_reranker=False,  # offline index construction only
     )
     print(f"      loaded in {time.time()-t0:.1f}s")
     print(f"      doc_chunks={len(idx.doc_retriever.chunks)} schema={len(idx.schema_index.entries)} cells={len(idx.cell_index.entries)}")
@@ -108,9 +109,10 @@ def main():
     print(f"      saved in {time.time()-t0:.1f}s")
 
     print("\nDone. Verify with:")
-    print(f"  python -c \"from offline.multiview_index import MultiviewIndex; "
+    print(f"  python -c \"from atr.offline.multiview_index import MultiviewIndex; "
           f"idx = MultiviewIndex.load('{args.save_path}', "
-          f"bge_model_path='{args.bge_dir}', device='cuda', require_cuda=True); "
+          f"bge_model_path='{args.bge_dir}', device='cuda', require_cuda=True, "
+          f"enable_reranker=False); "
           f"print(len(idx.row_index.entries), 'rows')\"")
 
 if __name__ == "__main__":

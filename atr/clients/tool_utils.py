@@ -15,7 +15,7 @@ from typing import List, Sequence, Union
 import numpy as np
 import torch
 from openpyxl import load_workbook
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 import os
 
 
@@ -109,6 +109,67 @@ class Embedder:
         hidden = self.model(**batch)[0]
         cls_vectors = hidden[:, 0]                 # BGE-M3 pools on the CLS token
         return cls_vectors.float().cpu().numpy()
+
+
+class Reranker:
+    """BGE-reranker-v2-M3 cross-encoder scorer."""
+
+    def __init__(
+        self,
+        model_name_or_path: str,
+        device: Union[str, int, None] = "auto",
+        require_cuda: bool = False,
+        max_length: int = 512,
+    ) -> None:
+        self.device = resolve_runtime_device(device, require_cuda=require_cuda)
+        self.max_length = max_length
+        self.default_batch_size = int(os.getenv("ATR_RERANK_BATCH", "32"))
+        self.use_fp16 = (
+            self.device.type == "cuda" and os.getenv("ATR_FP16", "1") == "1"
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=True,
+        )
+        if self.use_fp16:
+            model = model.half()
+        self.model = model.to(self.device).eval()
+
+    @torch.no_grad()
+    def compute_score(
+        self,
+        sentence_pairs: Sequence[Sequence[str]],
+        batch_size: int | None = None,
+    ) -> List[float]:
+        """Score ``[query, passage]`` pairs, shrinking batches after GPU OOM."""
+        if not sentence_pairs:
+            return []
+        batch_size = max(1, batch_size or self.default_batch_size)
+        all_scores: List[float] = []
+        start = 0
+        while start < len(sentence_pairs):
+            current_batch_size = min(batch_size, len(sentence_pairs) - start)
+            while True:
+                try:
+                    batch = list(sentence_pairs[start:start + current_batch_size])
+                    inputs = self.tokenizer(
+                        batch,
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_length,
+                        return_tensors="pt",
+                    ).to(self.device)
+                    logits = self.model(**inputs, return_dict=True).logits
+                    all_scores.extend(logits.view(-1).float().cpu().tolist())
+                    start += current_batch_size
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    if self.device.type != "cuda" or current_batch_size == 1:
+                        raise
+                    torch.cuda.empty_cache()
+                    current_batch_size = max(1, current_batch_size // 2)
+        return all_scores
 
 
 def excel_to_markdown(file_path: str) -> str:
