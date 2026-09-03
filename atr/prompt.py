@@ -756,7 +756,11 @@ Expected operator      : {expected_operator}
 Required modalities    : {required_modalities}
 Entity mentions        : [{entity_mentions}]
 Schema available       : {has_schema}
+Need global table view : {need_global_table_view}
+Residual uncertainty   : {uncertainty}
+Restored schema        : {schema_detail}
 Already-failed routes  : [{failed_routes}]
+Failure history H      : {failure_history}
 
 ═══════════════════════════════════════════════════════════════
 ROUTE DESCRIPTIONS
@@ -813,8 +817,7 @@ Rule 3.5 — RETRIEVE (escalation fallback after HYBRID failure)
   AND entity_mentions is NON-EMPTY
   AND "HYBRID" is in already-failed routes
   → RETRIEVE
-  (Escalation chain: SQL → HYBRID → RETRIEVE → TEXT.
-   After HYBRID fails, always try RETRIEVE before TEXT.)
+  (On every retry, re-apply these rules after excluding all failed routes.)
 
 Rule 4 — RETRIEVE (lookup with grounding)
   IF operator ∈ {{lookup, filter}}

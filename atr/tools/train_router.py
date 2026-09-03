@@ -10,8 +10,8 @@ Step 1: Oracle label generation
                    pick argmin Cost(r) s.t. IsCorrect(r, q)
                      Cost(r) = latency_s + ROUTE_BASE_COST[r]
                    Requires a running Flask SQL service and LLM credentials.
-  (c) from_inference : extract oracle labels from a logged inference run
-                       that recorded verified_route per sub-query step.
+  (c) from_inference : extract verified route labels, including restored schema
+                       and cumulative H, from an ``--emit_trace`` inference run.
 
 Step 2: Fine-tuning  (train)
   Fine-tune distilbert-base-uncased on oracle-labelled examples.
@@ -82,18 +82,26 @@ _ROUTE_BASE_COST: Dict[str, float] = {
 _AGGREGATE_OPERATORS = {"count", "aggregate", "sort", "arithmetic", "compare"}
 
 def featurise(record: Dict[str, Any]) -> str:
-    sub_query = record.get("sub_query", "")
-    op  = record.get("expected_operator", "lookup") or "lookup"
-    mod = record.get("required_modalities", "both") or "both"
-    entities = record.get("entity_mentions", [])
-    entities_str = ", ".join(entities) if entities else "none"
-    has_schema = "yes" if record.get("has_schema", False) else "no"
-    return (
-        f"[QUERY] {sub_query} "
-        f"[OP] {op} "
-        f"[MOD] {mod} "
-        f"[ENT] {entities_str} "
-        f"[SCHEMA] {has_schema}"
+    from atr.online.router import build_router_input
+
+    schema = record.get("schema")
+    if not schema and record.get("has_schema", False):
+        schema = {
+            "table_name": record.get("table_id", "unknown"),
+            "columns": record.get("schema_columns", []),
+        }
+    history = record.get("history_H", [])
+    if not history and record.get("failed_routes"):
+        history = [{"route": route} for route in record["failed_routes"]]
+    return build_router_input(
+        sub_query=record.get("sub_query", ""),
+        expected_operator=record.get("expected_operator", "lookup") or "lookup",
+        required_modalities=record.get("required_modalities", "both") or "both",
+        entity_mentions=record.get("entity_mentions", []),
+        need_global_table_view=bool(record.get("need_global_table_view", False)),
+        uncertainty=record.get("uncertainty", 0.0),
+        schema=schema,
+        history_H=history,
     )
 
 def _load_oracle_records(oracle_file: str) -> List[Dict]:
@@ -471,26 +479,69 @@ def relabel_soft_records(oracle_file: str, out_file: str) -> None:
 
 def load_inference_oracle(inference_log: str, out_file: str) -> None:
     """
-    Extract oracle labels from an inference JSONL produced with --log_routes.
-    Each step record must contain a verified_route field (route that achieved verdict=1).
+    Extract accepted route labels from an inference JSONL.
+
+    Current logs are produced with ``atr.online.main --emit_trace`` and store
+    each decision under ``atr_trace.verifier_decisions``.  The legacy flat
+    ``verified_route`` format remains accepted for backwards compatibility.
     """
     os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
     written = 0
     with open(inference_log) as fin, open(out_file, "w") as fout:
         for line in fin:
             rec = json.loads(line)
-            if "verified_route" not in rec:
-                continue
-            oracle_rec = {
-                "sub_query": rec["sub_query"],
-                "expected_operator": rec.get("expected_operator", "lookup"),
-                "required_modalities": rec.get("required_modalities", "both"),
-                "entity_mentions": rec.get("entity_mentions", []),
-                "has_schema": rec.get("has_schema", False),
-                "oracle_route": rec["verified_route"],
-            }
-            fout.write(json.dumps(oracle_rec, ensure_ascii=False) + "\n")
-            written += 1
+            trace = rec.get("atr_trace") or {}
+            decisions = trace.get("verifier_decisions") or []
+            if decisions:
+                candidates = [d for d in decisions if d.get("accepted") is True]
+            elif rec.get("verified_route"):
+                candidates = [{**rec, "route": rec["verified_route"]}]
+            else:
+                candidates = []
+
+            for decision in candidates:
+                route = decision.get("route")
+                if route not in LABEL2ID:
+                    continue
+                schema = decision.get("schema", rec.get("schema"))
+                oracle_rec = {
+                    "question_id": decision.get(
+                        "question_id", rec.get("question_id", rec.get("id", ""))
+                    ),
+                    "question": rec.get("question", ""),
+                    "table_id": rec.get("table_id", ""),
+                    "sub_query": decision.get(
+                        "sub_query", rec.get("sub_query", rec.get("question", ""))
+                    ),
+                    "expected_operator": decision.get(
+                        "expected_operator", rec.get("expected_operator", "lookup")
+                    ),
+                    "required_modalities": decision.get(
+                        "required_modalities", rec.get("required_modalities", "both")
+                    ),
+                    "entity_mentions": decision.get(
+                        "entity_mentions", rec.get("entity_mentions", [])
+                    ),
+                    "need_global_table_view": decision.get(
+                        "need_global_table_view",
+                        rec.get("need_global_table_view", False),
+                    ),
+                    "uncertainty": decision.get(
+                        "uncertainty", rec.get("uncertainty", 0.0)
+                    ),
+                    "schema": schema,
+                    "has_schema": bool(schema) or decision.get(
+                        "has_schema", rec.get("has_schema", False)
+                    ),
+                    "history_H": decision.get(
+                        "history_H", rec.get("history_H", [])
+                    ),
+                    "oracle_route": route,
+                    "oracle_correct": True,
+                    "label_source": "verified_inference",
+                }
+                fout.write(json.dumps(oracle_rec, ensure_ascii=False) + "\n")
+                written += 1
     logger.info(f"Loaded {written} verified-route labels → {out_file}")
 
 def train(
@@ -579,6 +630,7 @@ def train(
     model = DistilBertForSequenceClassification.from_pretrained(
         model_name, num_labels=4, id2label=ID2LABEL, label2id=LABEL2ID,
     ).to(device)
+    model.config.router_input_version = 2
 
     optimizer    = AdamW(model.parameters(), lr=lr)
     total_steps  = len(train_loader) * epochs
@@ -1108,6 +1160,7 @@ def generate_llm_distill(
     data_file: str,
     backbone: str,
     out_file: str,
+    excel_dir: Optional[str] = None,
     max_questions: Optional[int] = None,
     sample_seed: int = 42,
     max_workers: int = 8,
@@ -1117,16 +1170,16 @@ def generate_llm_distill(
 
     For each (optionally sampled) question:
       1. Decompose → first sub-query q_t  (1 LLM call)
-      2. LLMRouter.route(q_t)             (1 LLM call)
-    and record (sub-query features → predicted route) as an oracle-format
-    record. No retrieval index is needed: `has_schema` is set to True because
-    every HybridQA question references exactly one table (so a schema chunk is
-    expected to be retrievable at inference time).
+      2. LLMRouter.route(q_t, H)           (up to 4 LLM calls)
+    and record the initial choice plus teacher re-selections under cumulative
+    failed-route histories.  When ``excel_dir`` is supplied, the same concrete
+    column/type/example schema used online is serialized into every input.
 
     Output JSONL is directly consumable by `train` / `eval`.
     """
     import random
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from functools import lru_cache
 
     from atr.online.decomposer import QueryDecomposer
     from atr.online.router import LLMRouter
@@ -1142,34 +1195,88 @@ def generate_llm_distill(
         data = rng.sample(data, max_questions)
     logger.info(f"LLM-distill over {len(data)} questions (backbone={backbone}, workers={max_workers})")
 
-    def _one(item: Dict) -> Optional[Dict]:
+    @lru_cache(maxsize=None)
+    def _schema_from_file(table_id: str) -> Optional[Dict[str, Any]]:
+        if not excel_dir:
+            return None
+        import pandas as pd
+
+        for suffix in (".xlsx", ".xls", ".csv"):
+            path = os.path.join(excel_dir, f"{table_id}{suffix}")
+            if not os.path.isfile(path):
+                continue
+            try:
+                frame = (
+                    pd.read_csv(path, dtype=str)
+                    if suffix == ".csv"
+                    else pd.read_excel(path, dtype=str)
+                )
+            except Exception as exc:
+                logger.warning(f"  schema load failed for {path}: {exc}")
+                return None
+            columns = []
+            for column in frame.columns:
+                examples = frame[column].dropna().unique()[:3].tolist()
+                columns.append([
+                    str(column),
+                    str(frame[column].dtype),
+                    ", ".join(str(value) for value in examples),
+                ])
+            return {"table_name": table_id, "columns": columns}
+        return None
+
+    if not excel_dir and not any(
+        item.get("schema") or item.get("schema_columns") for item in data
+    ):
+        logger.warning(
+            "Distillation data has no concrete schema columns; pass --excel_dir "
+            "for paper-aligned router inputs."
+        )
+
+    def _one(item: Dict) -> List[Dict]:
         question = item["question"]
         table_id = item["table_id"]
         try:
             sub_q = decomposer.decompose(question, [], table_id=table_id)
         except Exception as exc:
             logger.warning(f"  decompose failed: {exc}")
-            return None
+            return []
         if getattr(sub_q, "is_terminate", False) or not getattr(sub_q, "sub_query", ""):
-            return None
-        stub_schema = {"table_id": table_id}  # has_schema = yes
-        try:
-            route = router.route(sub_q.sub_query, sub_q, stub_schema, [])
-        except Exception as exc:
-            logger.warning(f"  route failed: {exc}")
-            return None
-        return {
-            "sub_query": sub_q.sub_query,
-            "expected_operator": sub_q.expected_operator,
-            "required_modalities": sub_q.required_modalities,
-            "entity_mentions": sub_q.entity_mentions or [],
-            "has_schema": True,
-            "oracle_route": route.value,
-            "oracle_correct": True,           # distillation labels treated as gold
-            "question": question,
-            "table_id": table_id,
-            "source": "llm_distill",
+            return []
+        schema = item.get("schema") or _schema_from_file(table_id) or {
+            "table_name": table_id,
+            "columns": item.get("schema_columns", []),
         }
+        history: List[Dict[str, Any]] = []
+        records = []
+        for _attempt in range(4):
+            try:
+                route = router.route(sub_q.sub_query, sub_q, schema, history)
+            except Exception as exc:
+                logger.warning(f"  route failed: {exc}")
+                break
+            records.append({
+                "sub_query": sub_q.sub_query,
+                "expected_operator": sub_q.expected_operator,
+                "required_modalities": sub_q.required_modalities,
+                "entity_mentions": sub_q.entity_mentions or [],
+                "need_global_table_view": sub_q.need_global_table_view,
+                "uncertainty": sub_q.uncertainty,
+                "schema": schema,
+                "has_schema": True,
+                "history_H": [dict(failure) for failure in history],
+                "oracle_route": route.value,
+                "oracle_correct": True,
+                "question": question,
+                "table_id": table_id,
+                "source": "llm_distill",
+            })
+            history.append({
+                "sub_query": sub_q.sub_query,
+                "route": route.value,
+                "verdict": 0.5,
+            })
+        return records
 
     os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
     written = skipped = 0
@@ -1177,14 +1284,17 @@ def generate_llm_distill(
     with open(out_file, "w") as fout, ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(_one, item): i for i, item in enumerate(data)}
         for done, fut in enumerate(as_completed(futures), 1):
-            rec = fut.result()
-            if rec is None:
+            records = fut.result()
+            if not records:
                 skipped += 1
             else:
-                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                for rec in records:
+                    fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    written += 1
+                    label_counts[rec["oracle_route"]] = (
+                        label_counts.get(rec["oracle_route"], 0) + 1
+                    )
                 fout.flush()
-                written += 1
-                label_counts[rec["oracle_route"]] = label_counts.get(rec["oracle_route"], 0) + 1
             if done % 200 == 0:
                 logger.info(f"  [{done}/{len(data)}] written={written} skipped={skipped} {label_counts}")
     logger.info(f"LLM-distill done: {written} written, {skipped} skipped → {out_file}")
@@ -1230,13 +1340,15 @@ def main() -> None:
     dst.add_argument("--data_file",     required=True, help="QA dataset JSON/JSONL (e.g. HybridQA train.json)")
     dst.add_argument("--backbone",      default="gemini", help="LLM backbone key from config_mapping")
     dst.add_argument("--out_file",      required=True, help="Output oracle JSONL")
+    dst.add_argument("--excel_dir",     default=None,
+                     help="Table .xlsx/.xls/.csv directory used to serialize actual schemas")
     dst.add_argument("--max_questions", type=int, default=None, help="Sample this many questions (seeded)")
     dst.add_argument("--sample_seed",   type=int, default=42)
     dst.add_argument("--max_workers",   type=int, default=8)
 
     # ── from_inference ───────────────────────────────────────────────────────
     inf = sub.add_parser("from_inference",
-                         help="Extract oracle labels from inference log with verified_route field")
+                         help="Extract accepted labels from an --emit_trace inference log")
     inf.add_argument("--inference_log", required=True)
     inf.add_argument("--out_file",      required=True)
 
@@ -1322,6 +1434,7 @@ def main() -> None:
             bge_dir=args.bge_dir,
             backbone=args.backbone,
             out_file=args.out_file,
+            excel_dir=args.excel_dir,
             device=args.device,
             max_questions=args.max_questions,
         )

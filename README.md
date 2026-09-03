@@ -68,6 +68,11 @@ python -m atr.tools.download_router --out_dir ./models/atr_router
 
 A hosted checkpoint will be linked here once it is up.
 
+The current router input (v2) includes the full SubQuery metadata, restored
+schema, and cumulative failed-route history. A checkpoint trained with an
+older input format still loads with a warning, but must be retrained with the
+current `distill` and `train` commands for paper-aligned re-routing.
+
 ### Credentials safety
 
 `vertexai.json` (GCP service-account) and any local database config are git-ignored. To get a second line of defence that aborts commits containing those files even if `.gitignore` is bypassed, opt in to the bundled pre-commit hook once:
@@ -181,10 +186,12 @@ Useful flags:
 # (a) Teacher labels. Either distil them from an LLM router run directly...
 python -m atr.tools.train_router distill \
     --data_file $DATA_DIR/hybridqa_shard50_B.json \
+    --excel_dir $DATA_DIR/dev_excel \
     --backbone  gemini \
     --out_file  labels/router_labels_hybridqa.jsonl
 
-# ...or recover them from a completed LLM-routed inference log:
+# ...or recover accepted routes from an LLM-routed inference log generated
+# with --emit_trace (the trace preserves schema + cumulative failure history):
 python -m atr.tools.train_router from_inference \
     --inference_log output/atr_hybridqa_llm.jsonl \
     --out_file      labels/router_labels_hybridqa.jsonl
@@ -200,6 +207,9 @@ python -m atr.tools.train_router eval \
     --model_dir   ./models/atr_router_distilbert \
     --oracle_file labels/router_labels_hybridqa.jsonl
 ```
+
+`distill` records the teacher's initial route and its re-selections for up to
+three cumulative failed-route histories, matching the online escalation loop.
 
 ### 4. Evaluate inference outputs
 

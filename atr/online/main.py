@@ -453,6 +453,7 @@ class AgenticTableRAGAgent:
         table_name_list: Optional[List[str]] = None,
         question_id: str = "Q",
         gold_answer: Optional[str] = None,
+        trace: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Algorithm 1: Agentic TableRAG Online Inference.
@@ -474,6 +475,7 @@ class AgenticTableRAGAgent:
         # Thread-local list (not an instance attribute) to stay thread-safe
         # under BatchRunner's multi-worker execution.
         oracle_candidates: List[str] = []
+        verifier_decisions: List[Dict[str, Any]] = []
 
         # Feature 3: expand table_name_list with normalized variants
         raw_table_names = table_name_list or []
@@ -566,6 +568,7 @@ class AgenticTableRAGAgent:
                 H=H,
                 question_id=question_id,
                 oracle_candidates=oracle_candidates,
+                decisions=verifier_decisions if trace is not None else None,
             )
 
             step_failed = not _is_verified_answer(y_t, c_exec)
@@ -625,6 +628,17 @@ class AgenticTableRAGAgent:
                         break
         if not final_answer:
             final_answer = "not found"
+
+        if trace is not None:
+            trace.update({
+                "question_id": question_id,
+                "verifier_decisions": verifier_decisions,
+                "n_escalations": sum(
+                    1 for decision in verifier_decisions
+                    if not decision["accepted"]
+                ),
+                "final_answer": final_answer,
+            })
 
         # Oracle verifier (upper bound): if any answer ATR produced this
         # question matches the gold, a perfect verifier could have selected or
@@ -695,6 +709,7 @@ class AgenticTableRAGAgent:
         H: List[Dict],
         question_id: str,
         oracle_candidates: Optional[List[str]] = None,
+        decisions: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[str, float]:
         """
         Execute by route, verify, and escalate if needed (Lines 10–26 of Algo 1).
@@ -734,6 +749,27 @@ class AgenticTableRAGAgent:
             )
             logger.info(f"[{question_id}] Verifier verdict={verdict}")
 
+            if decisions is not None:
+                decisions.append({
+                    "question_id": question_id,
+                    "sub_query": getattr(sub_q, "sub_query", ""),
+                    "expected_operator": getattr(sub_q, "expected_operator", "lookup"),
+                    "required_modalities": getattr(sub_q, "required_modalities", "both"),
+                    "entity_mentions": getattr(sub_q, "entity_mentions", []) or [],
+                    "need_global_table_view": bool(
+                        getattr(sub_q, "need_global_table_view", False)
+                    ),
+                    "uncertainty": getattr(sub_q, "uncertainty", 0.0),
+                    "schema": schema,
+                    "has_schema": bool(schema),
+                    "history_H": [dict(item) for item in H],
+                    "route": route.value,
+                    "attempt": attempt + 1,
+                    "verdict": verdict,
+                    "accepted": not self.verifier.is_rejected(verdict),
+                    "produced_answer": y_t,
+                })
+
             if not self.verifier.is_rejected(verdict):
                 return y_t, 1.0
 
@@ -747,8 +783,19 @@ class AgenticTableRAGAgent:
             # consistently; the previous mix of enum and string caused
             # `r.get("route")` to mismatch and effectively skip the
             # failed-routes filter on retries.
-            H.append({"route": route.value, "verdict": verdict, "step": len(H) + 1})
-            new_route = self.router.escalate(route, history_H=H)
+            H.append({
+                "sub_query": sub_q.sub_query,
+                "route": route.value,
+                "verdict": verdict,
+                "step": len(H) + 1,
+            })
+            new_route = self.router.reselect(
+                sub_query=sub_q.sub_query,
+                meta=sub_q,
+                schema=schema,
+                history_H=H,
+                current_route=route,
+            )
             if new_route == route:
                 # Terminal: TEXT and already tried
                 break
@@ -944,6 +991,7 @@ class BatchRunner:
         save_file: str,
         max_workers: int = 1,
         rerun: bool = False,
+        emit_trace: bool = False,
     ) -> None:
         with open(data_file, "r", encoding="utf-8") as f:
             if data_file.endswith(".jsonl"):
@@ -973,18 +1021,22 @@ class BatchRunner:
             gold = case.get("answer-text") or case.get("answer") or case.get("answers") or ""
             if isinstance(gold, list):
                 gold = " ".join(str(g) for g in gold)
+            trace: Optional[Dict[str, Any]] = {} if emit_trace else None
             try:
                 answer = self.agent.run_single(
                     question=case["question"],
                     table_name_list=table_names,
                     question_id=str(qid),
                     gold_answer=str(gold) if gold else None,
+                    trace=trace,
                 )
             except Exception as exc:
                 logger.error(f"[{qid}] Error: {exc}")
                 traceback.print_exc()
                 answer = "error"
             result = {**case, "agentic_tablerag_answer": answer}
+            if trace is not None:
+                result["atr_trace"] = trace
             return result
 
         with open(save_file, "a" if rerun else "w", encoding="utf-8") as fout:
@@ -1050,6 +1102,11 @@ if __name__ == "__main__":
     parser.add_argument("--max_iter", type=int, default=MAX_ITER)
     parser.add_argument("--max_workers", type=int, default=1)
     parser.add_argument("--rerun", action="store_true")
+    parser.add_argument(
+        "--emit_trace", action="store_true",
+        help="Write per-question verifier decisions, router inputs, and "
+             "failure histories under `atr_trace` for router distillation.",
+    )
     parser.add_argument(
         "--router_type", type=str, default="heuristic",
         choices=["heuristic", "llm", "learned", "fixed"],
@@ -1171,5 +1228,6 @@ if __name__ == "__main__":
         save_file=args.save_file_path,
         max_workers=args.max_workers,
         rerun=args.rerun,
+        emit_trace=args.emit_trace,
     )
     print(f"Done in {time.time() - start:.1f}s")

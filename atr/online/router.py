@@ -16,11 +16,9 @@ class Route(str, Enum):
     RETRIEVE = "RETRIEVE"
     HYBRID = "HYBRID"
 
-# Escalation order (§3.6), specific-first: a failed route escalates to the
-# next most constrained alternative, ending at free-form text reading. Trying
-# structured routes before TEXT beats the reverse order on dev, and this is
-# the chain used for the reported results.
-# Each entry maps the current route to the one tried next.
+# Compatibility chain used by BaseRouter and explicit FixedRouter ablations.
+# Normal online retries call ``reselect`` and therefore re-run the active
+# policy on the paper-defined input with the updated failure history H.
 _ESCALATION: Dict[Route, Route] = {
     Route.SQL: Route.HYBRID,        # SQL failed → try HYBRID (constrained variant)
     Route.HYBRID: Route.RETRIEVE,   # HYBRID failed → RETRIEVE (cell lookup)
@@ -30,6 +28,126 @@ _ESCALATION: Dict[Route, Route] = {
 
 _AGGREGATE_OPERATORS = {"count", "aggregate", "sort", "arithmetic", "compare"}
 _LOOKUP_OPERATORS = {"lookup", "filter"}
+
+
+def _first_available_route(
+    failed_routes: Any,
+    order: tuple[Route, ...] = (
+        Route.RETRIEVE, Route.SQL, Route.HYBRID, Route.TEXT,
+    ),
+) -> Route:
+    failed = {
+        route.value if isinstance(route, Route) else str(route)
+        for route in failed_routes
+        if route
+    }
+    for route in order:
+        if route.value not in failed:
+            return route
+    return Route.TEXT
+
+
+def _failed_route_names(
+    history_H: Optional[List[Dict[str, Any]]],
+    sub_query: str,
+) -> set[str]:
+    """Return routes rejected for this sub-query, while retaining global H.
+
+    Older traces did not record ``sub_query`` on failures; those entries stay
+    applicable for backwards compatibility.
+    """
+    failed = set()
+    for item in history_H or []:
+        if not isinstance(item, dict):
+            route, failed_query = item, ""
+        else:
+            route = item.get("route")
+            failed_query = item.get("sub_query", "")
+        if failed_query and failed_query != sub_query:
+            continue
+        if isinstance(route, Route):
+            route = route.value
+        if route:
+            failed.add(str(route))
+    return failed
+
+
+def _schema_feature(schema: Optional[Dict[str, Any]]) -> str:
+    """Serialize the restored View-2 schema for the student-router input."""
+    if not schema:
+        return "none"
+    table_name = schema.get("table_name") or schema.get("table_id") or "unknown"
+    columns = []
+    for entry in schema.get("columns", []) or []:
+        if isinstance(entry, dict):
+            name = entry.get("col_name") or entry.get("name") or ""
+            dtype = entry.get("dtype") or entry.get("type") or ""
+            examples = entry.get("examples") or ""
+        elif isinstance(entry, (list, tuple)) and entry:
+            name = entry[0]
+            dtype = entry[1] if len(entry) > 1 else ""
+            examples = entry[2] if len(entry) > 2 else ""
+        else:
+            name, dtype, examples = str(entry), "", ""
+        if name:
+            description = f"{name}:{dtype}" if dtype else str(name)
+            if examples:
+                description += f" examples={examples}"
+            columns.append(description)
+    column_text = ", ".join(columns) if columns else "unknown"
+    return f"table={table_name}; columns={column_text}"
+
+
+def _history_feature(history_H: Optional[List[Dict[str, Any]]]) -> str:
+    """Serialize failed routes and verdicts in attempt order."""
+    if not history_H:
+        return "none"
+    failures = []
+    for item in history_H:
+        if isinstance(item, dict):
+            route = item.get("route")
+            verdict = item.get("verdict")
+            failed_query = item.get("sub_query", "")
+        else:
+            route, verdict, failed_query = item, None, ""
+        if isinstance(route, Route):
+            route = route.value
+        if not route:
+            continue
+        detail = str(route) if verdict is None else f"{route}:{verdict}"
+        failures.append(f"{failed_query} => {detail}" if failed_query else detail)
+    return ", ".join(failures) if failures else "none"
+
+
+def build_router_input(
+    sub_query: str,
+    expected_operator: str,
+    required_modalities: str,
+    entity_mentions: Optional[List[str]],
+    need_global_table_view: bool,
+    uncertainty: float,
+    schema: Optional[Dict[str, Any]],
+    history_H: Optional[List[Dict[str, Any]]],
+) -> str:
+    """Build the paper-defined ``(q_t, meta_t, schema_t, H)`` input."""
+    entities = ", ".join(entity_mentions or []) or "none"
+    has_schema = "yes" if schema else "no"
+    try:
+        uncertainty_text = f"{float(uncertainty):.3f}"
+    except (TypeError, ValueError):
+        uncertainty_text = "0.000"
+    return (
+        f"[QUERY] {sub_query} "
+        f"[OP] {expected_operator or 'lookup'} "
+        f"[MOD] {required_modalities or 'both'} "
+        f"[ENT] {entities} "
+        f"[SCHEMA] {has_schema} "
+        f"[GLOBAL] {'yes' if need_global_table_view else 'no'} "
+        f"[UNCERTAINTY] {uncertainty_text} "
+        f"[FAILED] {_history_feature(history_H)} "
+        f"[SCHEMA_DETAIL] {_schema_feature(schema)}"
+    )
+
 
 class BaseRouter:
     """Common interface for all router variants."""
@@ -48,14 +166,25 @@ class BaseRouter:
         current_route: Route,
         history_H: Optional[List[Dict[str, Any]]] = None,
     ) -> Route:
-        """§3.6 EscalatePolicy. Default: fixed global chain (TEXT → HYBRID
-        → SQL → RETRIEVE).  Subclasses (e.g., LearnedRouter) may override to
-        provide adaptive ordering using their own confidence ranking; the
-        history_H argument lets them skip any routes already tried.
+        """Compatibility fallback for callers that explicitly request a chain.
+
+        Paper-aligned online inference uses :meth:`reselect`, which invokes the
+        active policy again with updated ``H``.
         """
         next_route = _ESCALATION.get(current_route, Route.TEXT)
         logger.info(f"EscalatePolicy: {current_route} → {next_route}")
         return next_route
+
+    def reselect(
+        self,
+        sub_query: str,
+        meta: Any,
+        schema: Optional[Dict[str, Any]],
+        history_H: List[Dict[str, Any]],
+        current_route: Route,
+    ) -> Route:
+        """Re-invoke the routing policy with updated failed-route history."""
+        return self.route(sub_query, meta, schema, history_H)
 
 class HeuristicRouter(BaseRouter):
     """
@@ -86,7 +215,7 @@ class HeuristicRouter(BaseRouter):
         is_aggregate = op in _AGGREGATE_OPERATORS
         is_lookup = op in _LOOKUP_OPERATORS
 
-        failed_routes = {r.get("route") for r in history_H}
+        failed_routes = _failed_route_names(history_H, sub_query)
 
         # ── Rule 1, TEXT: descriptive / no table signal ──────────────────
         # Only when the question is unambiguously textual (modalities="text")
@@ -151,8 +280,12 @@ class HeuristicRouter(BaseRouter):
             return Route.SQL
 
         # ── Rule 6: TEXT last resort ──────────────────────────────────────
-        logger.debug("Router → TEXT (last resort)")
-        return Route.TEXT
+        fallback = _first_available_route(
+            failed_routes,
+            (Route.TEXT, Route.RETRIEVE, Route.SQL, Route.HYBRID),
+        )
+        logger.debug(f"Router → {fallback.value} (last available route)")
+        return fallback
 
 class LLMRouter(BaseRouter):
     """
@@ -174,8 +307,9 @@ class LLMRouter(BaseRouter):
     ) -> Route:
         from atr.prompt import ROUTER_PROMPT
 
-        failed_routes = [r.get("route", "") for r in history_H if r.get("route")]
+        failed_routes = sorted(_failed_route_names(history_H, sub_query))
         has_schema = "yes" if schema is not None else "no"
+        failed_set = {r.upper() for r in failed_routes}
 
         prompt = ROUTER_PROMPT.format(
             sub_query=sub_query,
@@ -183,32 +317,43 @@ class LLMRouter(BaseRouter):
             required_modalities=meta.required_modalities or "both",
             entity_mentions=", ".join(meta.entity_mentions or []) or "none",
             has_schema=has_schema,
+            need_global_table_view=(
+                "yes" if getattr(meta, "need_global_table_view", False) else "no"
+            ),
+            uncertainty=getattr(meta, "uncertainty", 0.0),
+            schema_detail=_schema_feature(schema),
             failed_routes=", ".join(failed_routes) if failed_routes else "none",
+            failure_history=_history_feature(history_H),
         )
         messages = [{"role": "user", "content": prompt}]
         try:
             response = self.llm_fn(messages)
         except Exception as exc:
-            logger.error(f"LLMRouter call failed: {exc}; defaulting to RETRIEVE")
-            return Route.RETRIEVE
+            fallback = _first_available_route(failed_set)
+            logger.error(
+                f"LLMRouter call failed: {exc}; defaulting to {fallback.value}"
+            )
+            return fallback
 
         # Parse: pick the first known route name in the response (longest first)
         response_upper = response.strip().upper()
-        failed_set = {r.upper() for r in failed_routes}
         for name in ("HYBRID", "RETRIEVE", "SQL", "TEXT"):
             if name in response_upper and name not in failed_set:
                 logger.debug(f"LLMRouter → {name}")
                 return Route(name)
 
-        logger.warning(f"LLMRouter: cannot parse route from '{response}'; defaulting to RETRIEVE")
-        return Route.RETRIEVE
+        fallback = _first_available_route(failed_set)
+        logger.warning(
+            f"LLMRouter: cannot parse route from '{response}'; "
+            f"defaulting to {fallback.value}"
+        )
+        return fallback
 
 class LearnedRouter(BaseRouter):
     """
     §3.4  Learned Router: DistilBERT fine-tuned 4-class classifier.
 
-    Input text format:
-      "[QUERY] {sub_query} [OP] {op} [MOD] {mod} [ENT] {entities} [SCHEMA] {yes|no}"
+    Input text implements the paper tuple ``(q_t, meta_t, schema_t, H)``.
 
     Label mapping: TEXT=0, SQL=1, RETRIEVE=2, HYBRID=3
 
@@ -236,6 +381,11 @@ class LearnedRouter(BaseRouter):
         )
         self.model.to(device)
         self.model.eval()
+        if getattr(self.model.config, "router_input_version", 1) < 2:
+            logger.warning(
+                "LearnedRouter checkpoint predates schema/history input v2; "
+                "retrain it with tools/train_router.py for paper-aligned routing."
+            )
         # Cache of the most recent forward pass so `escalate()` can reuse the
         # logits without re-running the DistilBERT forward. Reset on every
         # call to `route()`.
@@ -245,16 +395,17 @@ class LearnedRouter(BaseRouter):
     @staticmethod
     def featurise(sub_query: str, meta: Any, schema: Optional[Dict]) -> str:
         """Convert sub-query + metadata into a single classification input string."""
-        op = meta.expected_operator or "lookup"
-        mod = meta.required_modalities or "both"
-        entities = ", ".join(meta.entity_mentions or []) or "none"
-        has_schema = "yes" if schema is not None else "no"
-        return (
-            f"[QUERY] {sub_query} "
-            f"[OP] {op} "
-            f"[MOD] {mod} "
-            f"[ENT] {entities} "
-            f"[SCHEMA] {has_schema}"
+        return build_router_input(
+            sub_query=sub_query,
+            expected_operator=meta.expected_operator or "lookup",
+            required_modalities=meta.required_modalities or "both",
+            entity_mentions=meta.entity_mentions or [],
+            need_global_table_view=bool(
+                getattr(meta, "need_global_table_view", False)
+            ),
+            uncertainty=getattr(meta, "uncertainty", 0.0),
+            schema=schema,
+            history_H=[],
         )
 
     def route(
@@ -264,8 +415,19 @@ class LearnedRouter(BaseRouter):
         schema: Optional[Dict[str, Any]],
         history_H: List[Dict[str, Any]],
     ) -> Route:
-        text = self.featurise(sub_query, meta, schema)
-        failed_routes = {r.get("route") for r in history_H if r.get("route")}
+        text = build_router_input(
+            sub_query=sub_query,
+            expected_operator=meta.expected_operator or "lookup",
+            required_modalities=meta.required_modalities or "both",
+            entity_mentions=meta.entity_mentions or [],
+            need_global_table_view=bool(
+                getattr(meta, "need_global_table_view", False)
+            ),
+            uncertainty=getattr(meta, "uncertainty", 0.0),
+            schema=schema,
+            history_H=history_H,
+        )
+        failed_routes = _failed_route_names(history_H, sub_query)
 
         inputs = self.tokenizer(
             text, return_tensors="pt", truncation=True, max_length=256
@@ -274,9 +436,8 @@ class LearnedRouter(BaseRouter):
         with self._torch.no_grad():
             logits = self.model(**inputs).logits[0]
 
-        # Cache for adaptive escalation: escalate() reuses these logits
-        # so the escalation order respects per-sub-query router ranking
-        # rather than a fixed global chain.
+        # Cache for the legacy ``escalate`` compatibility method. Normal
+        # retries call ``reselect`` and perform a fresh H-conditioned forward.
         self._last_logits = logits
 
         # Pick highest-scoring non-failed route
@@ -294,32 +455,31 @@ class LearnedRouter(BaseRouter):
         current_route: Route,
         history_H: Optional[List[Dict[str, Any]]] = None,
     ) -> Route:
-        """Fixed specific-first escalation chain
-        (SQL $\\to$ HYBRID $\\to$ RETRIEVE $\\to$ TEXT), skipping any route
-        already attempted in this sub-query.
-
-        On dev this fixed chain outperforms a logit-ranked adaptive variant,
-        presumably because it orders by information yield given a verifier
-        rejection rather than by first-attempt prior. The set of already-attempted routes is read
-        from `history_H` so the chain never revisits a failed primitive.
-        """
+        """Compatibility path: choose the best cached non-failed student route."""
         history_H = history_H or []
         failed = {current_route.value}
         failed.update(h.get("route") for h in history_H if h.get("route"))
-
-        # Walk the global _ESCALATION chain, skipping anything we've already
-        # tried this sub-query.
-        nxt = _ESCALATION.get(current_route, Route.TEXT)
-        for _ in range(4):
-            if nxt.value not in failed:
-                logger.info(
-                    f"LearnedRouter.escalate {current_route} → {nxt} (fixed chain)"
-                )
-                return nxt
-            failed.add(nxt.value)
-            nxt = _ESCALATION.get(nxt, Route.TEXT)
-        # All 4 routes already attempted, degenerate, return TEXT as final fallback
+        if self._last_logits is not None:
+            for idx in self._last_logits.argsort(descending=True).tolist():
+                candidate = self.LABEL2ROUTE[idx]
+                if candidate.value not in failed:
+                    logger.info(
+                        f"LearnedRouter.escalate {current_route} → {candidate} "
+                        "(student-ranked)"
+                    )
+                    return candidate
         return Route.TEXT
+
+    def reselect(
+        self,
+        sub_query: str,
+        meta: Any,
+        schema: Optional[Dict[str, Any]],
+        history_H: List[Dict[str, Any]],
+        current_route: Route,
+    ) -> Route:
+        """Run the student again after encoding the updated history ``H``."""
+        return self.route(sub_query, meta, schema, history_H)
 
 class FixedRouter(BaseRouter):
     """Ablation router: returns the fixed route as first choice.
@@ -378,6 +538,17 @@ class FixedRouter(BaseRouter):
             return r
         # Chain exhausted: stay on TEXT (the universal fallback).
         return Route.TEXT
+
+    def reselect(
+        self,
+        sub_query: str,
+        meta: Any,
+        schema: Optional[Dict[str, Any]],
+        history_H: List[Dict[str, Any]],
+        current_route: Route,
+    ) -> Route:
+        """Keep fixed-router ablations on their explicitly requested chain."""
+        return self.escalate(current_route, history_H=history_H)
 
 def build_router(
     router_type: str,
