@@ -18,6 +18,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter  # noqa: E40
 
 logger = logging.getLogger(__name__)
 
+DOCUMENT_CHUNK_SIZE = 512
+DOCUMENT_CHUNK_OVERLAP = 64
+DOCUMENT_CHUNK_UNIT = "tokens"
+
 
 def _schema_entry_to_text(entry: Dict[str, Any]) -> str:
     return (
@@ -365,14 +369,25 @@ class DocumentRetriever:
     def __init__(
         self,
         embedder: Embedder,
-        chunk_size: int = 1000,
-        chunk_overlap: int = 200,
+        chunk_size: int = DOCUMENT_CHUNK_SIZE,
+        chunk_overlap: int = DOCUMENT_CHUNK_OVERLAP,
         reranker: Optional[CrossEncoderCandidateReranker] = None,
     ) -> None:
+        if chunk_size <= 0:
+            raise ValueError("document chunk size must be positive")
+        if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+            raise ValueError(
+                "document chunk overlap must be non-negative and smaller than chunk size"
+            )
         self.embedder = embedder
         self.reranker = reranker
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.chunk_unit = DOCUMENT_CHUNK_UNIT
         self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size, chunk_overlap=chunk_overlap
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=self._token_length,
         )
         self.chunks: List[str] = []
         self.chunk_source: List[str] = []   # filename per chunk
@@ -381,13 +396,31 @@ class DocumentRetriever:
         self.chunk_schema_map: Dict[int, Dict[str, Any]] = {}
         self._index: Optional[faiss.IndexFlatIP] = None
 
+    def _token_length(self, text: str) -> int:
+        """Measure chunks with the same tokenizer used by the BGE-M3 embedder."""
+        return len(self.embedder.tokenizer.encode(text, add_special_tokens=False))
+
+    def _split_document(self, filename: str, text: str) -> List[str]:
+        """Split content so the filename-prefixed embedding stays within the limit."""
+        prefix = f"File name: {filename}\n"
+        content_size = self.chunk_size - self._token_length(prefix)
+        if content_size <= self.chunk_overlap:
+            raise ValueError(
+                "filename metadata leaves no room for the configured document "
+                "chunk overlap"
+            )
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=content_size,
+            chunk_overlap=self.chunk_overlap,
+            length_function=self._token_length,
+        )
+        return [prefix + split for split in splitter.split_text(text)]
+
     # ── ingestion ───────────────────────────────────────────────────────────
 
     def add_text_document(self, filename: str, text: str) -> None:
         """View 1: Add a plain text document."""
-        splits = self.splitter.split_text(text)
-        for split in splits:
-            chunk = f"File name: {filename}\n{split}"
+        for chunk in self._split_document(filename, text):
             self.chunk_source.append(filename)
             self.chunk_type.append("text")
             self.chunks.append(chunk)
@@ -400,9 +433,7 @@ class DocumentRetriever:
         schema: Dict[str, Any],
     ) -> None:
         """View 2: Add a flattened table chunk with schema mapping."""
-        splits = self.splitter.split_text(markdown)
-        for split in splits:
-            chunk = f"File name: {filename}\n{split}"
+        for chunk in self._split_document(filename, markdown):
             idx = len(self.chunks)
             self.chunk_source.append(filename)
             self.chunk_type.append("table")
@@ -500,6 +531,8 @@ class MultiviewIndex:
         require_cuda: bool = False,
         reranker_model_path: Optional[str] = None,
         rerank_candidate_multiplier: int = 6,
+        document_chunk_size: int = DOCUMENT_CHUNK_SIZE,
+        document_chunk_overlap: int = DOCUMENT_CHUNK_OVERLAP,
     ) -> None:
         self.excel_dir = excel_dir
         self.doc_dir = doc_dir
@@ -518,7 +551,12 @@ class MultiviewIndex:
             )
             if reranker_model_path else None
         )
-        self.doc_retriever = DocumentRetriever(self.embedder, reranker=self.reranker)
+        self.doc_retriever = DocumentRetriever(
+            self.embedder,
+            chunk_size=document_chunk_size,
+            chunk_overlap=document_chunk_overlap,
+            reranker=self.reranker,
+        )
         self.schema_index = SchemaIndex(self.embedder, reranker=self.reranker)
         self.cell_index = CellIndex(
             self.embedder,
@@ -686,6 +724,11 @@ class MultiviewIndex:
             "doc_source": self.doc_retriever.chunk_source,
             "doc_type": self.doc_retriever.chunk_type,
             "doc_schema_map": self.doc_retriever.chunk_schema_map,
+            "document_chunk_config": {
+                "size": self.doc_retriever.chunk_size,
+                "overlap": self.doc_retriever.chunk_overlap,
+                "unit": self.doc_retriever.chunk_unit,
+            },
             "schema_entries": self.schema_index.entries,
             "cell_entries": self.cell_index.entries,
             "row_entries": self.row_index.entries,   # Phase F-A: View 4 (row component)
@@ -745,8 +788,33 @@ class MultiviewIndex:
         instance.save_path = save_path
         instance.table_schemas = payload["table_schemas"]
 
-        # Restore DocumentRetriever (Views 1+2)
-        dr = DocumentRetriever(embedder, reranker=reranker)
+        # Restore DocumentRetriever (Views 1+2). Legacy payloads contain
+        # character-based 1000/200 chunks and must be rebuilt for paper parity.
+        chunk_config = payload.get("document_chunk_config")
+        if chunk_config is None:
+            logger.warning(
+                "Index %s predates token-based 512/64 document chunking; "
+                "rebuild it with build_index.py for paper-aligned retrieval.",
+                save_path,
+            )
+            chunk_config = {
+                "size": DOCUMENT_CHUNK_SIZE,
+                "overlap": DOCUMENT_CHUNK_OVERLAP,
+                "unit": DOCUMENT_CHUNK_UNIT,
+            }
+        elif chunk_config.get("unit") != DOCUMENT_CHUNK_UNIT:
+            logger.warning(
+                "Index %s uses document chunk unit %r rather than tokens; "
+                "rebuild it for paper-aligned retrieval.",
+                save_path,
+                chunk_config.get("unit"),
+            )
+        dr = DocumentRetriever(
+            embedder,
+            chunk_size=int(chunk_config["size"]),
+            chunk_overlap=int(chunk_config["overlap"]),
+            reranker=reranker,
+        )
         dr.chunks = payload["doc_chunks"]
         dr.chunk_source = payload["doc_source"]
         dr.chunk_type = payload["doc_type"]

@@ -152,13 +152,17 @@ python -m atr.build_index \
     --doc_dir   ./data/docs \
     --bge_dir   ./models \
     --save_path ./index/hybridqa_multiview \
+    --document_chunk_size 512 \
+    --document_chunk_overlap 64 \
     --budget    10000
 ```
 
 Index construction only needs `<bge_dir>/bge-m3/`. Online retrieval recalls
 six times the requested result count with BGE-M3, then reranks the candidates
 for Views 1--4 with `<bge_dir>/bge-reranker-v2-m3/`. Existing indices do not
-need rebuilding.
+need rebuilding for reranking alone. Document chunks use the BGE-M3 tokenizer
+with the paper settings of 512 tokens and 64-token overlap. Indices built before
+this setting was introduced must be rebuilt; loading one emits a warning.
 
 ### 2. Run online inference (Algorithm 1)
 

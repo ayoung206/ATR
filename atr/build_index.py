@@ -22,7 +22,11 @@ import os
 import time
 
 from atr.clients.chat_utils import init_logger                    # noqa: E402
-from atr.offline.multiview_index import MultiviewIndex    # noqa: E402
+from atr.offline.multiview_index import (                 # noqa: E402
+    DOCUMENT_CHUNK_OVERLAP,
+    DOCUMENT_CHUNK_SIZE,
+    MultiviewIndex,
+)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build Agentic TableRAG Multiview Index")
@@ -43,6 +47,18 @@ def main() -> None:
                              "max_encode_cell semantics so every table "
                              "contributes equally (fixes 6.1%% global-cap "
                              "coverage problem).")
+    parser.add_argument(
+        "--document_chunk_size",
+        type=int,
+        default=DOCUMENT_CHUNK_SIZE,
+        help="Document chunk size in BGE-M3 tokens (paper default: 512)",
+    )
+    parser.add_argument(
+        "--document_chunk_overlap",
+        type=int,
+        default=DOCUMENT_CHUNK_OVERLAP,
+        help="Document chunk overlap in BGE-M3 tokens (paper default: 64)",
+    )
     parser.add_argument("--device", default="auto",
                         help="Device for embedding: auto|cpu|cuda|cuda:0")
     parser.add_argument("--require_cuda", action="store_true")
@@ -55,7 +71,9 @@ def main() -> None:
     logger.info(f"Building MultiviewIndex: excel={args.excel_dir}, doc={args.doc_dir}")
     logger.info(
         f"BGE model: {bge_model_path}, budget={args.budget}, "
-        f"per_table_quota={args.per_table_quota}, device={args.device}"
+        f"per_table_quota={args.per_table_quota}, device={args.device}, "
+        f"document_chunks={args.document_chunk_size}/"
+        f"{args.document_chunk_overlap} tokens"
     )
 
     start = time.time()
@@ -68,6 +86,8 @@ def main() -> None:
         per_table_quota=args.per_table_quota,
         device=args.device,
         require_cuda=args.require_cuda,
+        document_chunk_size=args.document_chunk_size,
+        document_chunk_overlap=args.document_chunk_overlap,
     )
     index.build()
     index.save()
