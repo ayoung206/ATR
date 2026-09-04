@@ -745,7 +745,7 @@ class AgenticTableRAGAgent:
         for attempt in range(max_attempts):
             logger.info(f"[{question_id}] Executing route={route.value} (attempt {attempt+1})")
 
-            y_t, sql_result, schema_cell_ev = self._execute_route(
+            y_t, sql_result, route_evidence = self._execute_route(
                 sub_q=sub_q,
                 original_question=original_question,
                 schema=schema,
@@ -764,6 +764,7 @@ class AgenticTableRAGAgent:
                 answer=y_t,
                 text_evidence=text_evidence,
                 sql_result=sql_result,
+                route_evidence=route_evidence,
             )
             logger.info(f"[{question_id}] Verifier verdict={verdict}")
 
@@ -834,7 +835,9 @@ class AgenticTableRAGAgent:
     ) -> Tuple[str, str, str]:
         """
         Execute a single route.
-        Returns (answer, sql_result, schema_cell_evidence_text).
+        Returns (answer, sql_result, route_evidence_text). The final value is
+        the evidence actually used to produce the answer, so verification sees
+        the same grounding context as the execution primitive.
         """
         sql_result = ""
         schema_cell_ev = ""
@@ -920,7 +923,7 @@ class AgenticTableRAGAgent:
             y_t = self.verifier.answer_from_text(
                 sub_q.sub_query, text_evidence, original_question=original_question
             )
-            return y_t, sql_result, schema_cell_ev
+            return y_t, sql_result, ""
 
         # ── RETRIEVE (Lines 12–15) ───────────────────────────────────────────
         # Phase F-A (Option A): pass View 4 row-component (RowIndex) rows to the synthesis
@@ -951,7 +954,10 @@ class AgenticTableRAGAgent:
                 cell_info=cell_info,
                 table_context=table_context,
             )
-            return y_t, sql_result, schema_cell_ev
+            route_evidence = "\n\n".join(
+                filter(None, [schema_info, cell_info, table_context])
+            )
+            return y_t, sql_result, route_evidence
 
         # ── HYBRID (Lines 18–21) ─────────────────────────────────────────────
         # D1 + E8 augmentation: arithmetic hint + type hint on the sub_query

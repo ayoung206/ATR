@@ -317,9 +317,14 @@ class EvidenceFusionVerifier:
         answer: str,
         text_evidence: str,
         sql_result: str,
+        route_evidence: str = "",
     ) -> float:
         """
-        LLM-as-a-judge verification.
+        LLM-as-a-judge verification over all evidence used by the route.
+
+        ``text_evidence`` contains the shared document chunks, while
+        ``route_evidence`` carries route-specific context such as retrieved
+        rows or schema/cell bindings.
 
         Returns:
             V(r) ∈ {0, 0.5, 1}, conflict / insufficient / support
@@ -327,7 +332,9 @@ class EvidenceFusionVerifier:
         if not answer or answer.strip().lower() in ("not found", ""):
             return VERDICT_INSUFFICIENT
 
-        evidence_combined = "\n\n".join(filter(None, [text_evidence, sql_result]))
+        evidence_combined = "\n\n".join(
+            filter(None, [text_evidence, route_evidence, sql_result])
+        )
         prompt = VERIFIER_PROMPT.format(
             question=question,
             answer=answer,
