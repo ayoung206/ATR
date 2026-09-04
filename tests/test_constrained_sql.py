@@ -2,14 +2,56 @@
 import unittest
 
 from atr.online import constrained_sql as subject
-from atr.online.value_linker import LinkedValue
+from atr.online.value_linker import LinkedValue, build_value_bindings_text
 
 
 def _binding() -> LinkedValue:
     return LinkedValue("1971", "Founded", "1971", 1.0)
 
 
+def _fuzzy_binding() -> LinkedValue:
+    return LinkedValue(
+        "Saint-Etienne",
+        "City",
+        "Saint Etienne",
+        0.3,
+        fallback_level=2,
+    )
+
+
 class SQLConstraintValidationTest(unittest.TestCase):
+    def test_formats_fuzzy_binding_as_like_with_canonical_value(self):
+        self.assertEqual(
+            build_value_bindings_text([_fuzzy_binding()]),
+            "City LIKE '%Saint Etienne%'",
+        )
+
+    def test_fuzzy_binding_requires_like_and_canonical_value(self):
+        self.assertEqual(
+            subject.validate_sql_constraints(
+                "SELECT Club FROM clubs WHERE City LIKE '%Saint Etienne%'",
+                ["Club", "City"],
+                ["clubs"],
+                [_fuzzy_binding()],
+            ),
+            [],
+        )
+
+        for invalid_sql in (
+            "SELECT Club FROM clubs WHERE City = 'Saint Etienne'",
+            "SELECT Club FROM clubs WHERE City LIKE '%Saint-Etienne%'",
+        ):
+            violations = subject.validate_sql_constraints(
+                invalid_sql,
+                ["Club", "City"],
+                ["clubs"],
+                [_fuzzy_binding()],
+            )
+            self.assertTrue(
+                any("missing fuzzy LIKE binding" in v for v in violations),
+                violations,
+            )
+
     def test_accepts_allowed_columns_table_and_exact_binding(self):
         violations = subject.validate_sql_constraints(
             "SELECT `Club` FROM `clubs` WHERE `Founded` = '1971'",

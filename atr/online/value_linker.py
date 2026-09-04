@@ -257,8 +257,7 @@ def build_value_bindings_text(linked_values: List[LinkedValue]) -> str:
     """Format V* for injection into SQL query prompts (§3.5)."""
     bindings = []
     for lv in linked_values:
-        if lv.is_matched:
-            bindings.append(f"{lv.column} = '{lv.matched_value}'")
-        elif lv.fallback_level == 2:
-            bindings.append(f"{lv.column} LIKE '%{lv.entity}%'")
+        clause = lv.to_where_clause()
+        if clause:
+            bindings.append(clause)
     return ", ".join(bindings) if bindings else "(none)"

@@ -141,6 +141,7 @@ def validate_sql_constraints(
             continue
         wanted_column = _normalise_identifier(linked.column)
         wanted_value = str(linked.matched_value)
+        expected_fuzzy_pattern = f"%{wanted_value}%"
         binding_found = False
         for where in where_nodes:
             for predicate in where.find_all(exp.Predicate):
@@ -153,20 +154,33 @@ def validate_sql_constraints(
                 ]
                 if wanted_column not in predicate_columns:
                     continue
+                if linked.fallback_level == 2:
+                    # Fuzzy fallback is a distinct, paper-defined weakening
+                    # level.  An equality predicate would silently turn it
+                    # back into an exact match, so require both the LIKE AST
+                    # node and the canonical linked value with wildcards.
+                    if (
+                        isinstance(predicate, exp.Like)
+                        and expected_fuzzy_pattern in literal_values
+                    ):
+                        binding_found = True
+                        break
+                    continue
                 if wanted_value in literal_values:
-                    binding_found = True
-                    break
-                if linked.fallback_level == 2 and any(
-                    wanted_value in literal.strip("%") for literal in literal_values
-                ):
                     binding_found = True
                     break
             if binding_found:
                 break
         if not binding_found:
-            violations.append(
-                f"missing exact WHERE binding: {linked.column}={wanted_value!r}"
-            )
+            if linked.fallback_level == 2:
+                violations.append(
+                    "missing fuzzy LIKE binding: "
+                    f"{linked.column} LIKE {expected_fuzzy_pattern!r}"
+                )
+            else:
+                violations.append(
+                    f"missing exact WHERE binding: {linked.column}={wanted_value!r}"
+                )
     return violations
 
 class ConstrainedSQLExecutor:
