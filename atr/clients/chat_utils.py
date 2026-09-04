@@ -152,10 +152,10 @@ def _decoding_kwargs(model: str) -> Dict[str, Any]:
         return {"temperature": 0.0}          # greedy keeps Scout's JSON well-formed
     if model.startswith("Qwen3"):
         return {
-            "temperature": 0.1,
+            "temperature": 0.0,
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
         }
-    return {"temperature": 0.1}
+    return {"temperature": 0.0}
 
 
 def _claude_reply(
@@ -181,7 +181,7 @@ def _claude_reply(
         "model": llm_config["model"],
         "messages": turns,
         "max_tokens": budget,
-        "temperature": 0.1,
+        "temperature": 0.0,
     }
     if system_prompt:
         kwargs["system"] = system_prompt

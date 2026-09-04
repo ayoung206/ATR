@@ -174,7 +174,7 @@ python -m atr.online.main \
     --bge_dir         ./models \
     --router_type     learned \
     --router_model_path ./models/atr_router_distilbert \
-    --max_iter 5 --device cuda --require_cuda \
+    --max_iter 5 --max_workers 2 --device cuda --require_cuda \
     --final_synthesis
 ```
 
@@ -183,6 +183,12 @@ Useful flags:
 - `--force_route HYBRID` (with `--router_type fixed`): ablate to a single primitive.
 - `--no_decomposition`: run the loop on the raw question (collapse to K_max=1).
 - `--verifier_threshold 0.1`: uncertainty cutoff for the stop controller.
+- `--max_workers 2`: process two independent dataset questions concurrently;
+  sub-queries within one question remain sequential.
+- RETRIEVE performs one row search with the current sub-query and returns
+  `ROW_TOP_K=10` rows; it does not issue extra entity-keyed row searches.
+- Non-reasoning backbones use temperature `0`. APIs that reject temperature
+  (for example, reasoning-enabled models) receive only their supported controls.
 - `--decomposer_backbone <key>`: drive only the decomposer with another backbone (rest stays on `--backbone`); decomposer-model robustness in Table 4.
 - `--verifier_backbone <key>`: drive only the verifier verdict with another backbone; verifier-model robustness in Table 4.
 - `--oracle_verifier`: upper bound, returning any produced candidate matching the gold, measuring the accuracy ceiling a perfect verifier could reach.

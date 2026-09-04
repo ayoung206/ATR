@@ -20,6 +20,7 @@ from atr.config import (  # noqa: E402
     MAX_ITER,
     SCHEMA_TOP_K,
     CELL_TOP_K,
+    ROW_TOP_K,
     VERIFIER_THRESHOLD,
     RERANK_CANDIDATE_MULTIPLIER,
 )
@@ -200,7 +201,7 @@ def _build_schema_preview(table_chunks: List[Dict], max_rows: int = 3) -> str:
         " sub-query is a single-cell lookup or requires COUNT/aggregate.)\n"
     )
 
-def _row_hits_to_markdown(hits: List[Dict], max_rows: int = 8) -> str:
+def _row_hits_to_markdown(hits: List[Dict], max_rows: int = ROW_TOP_K) -> str:
     """Phase F-A: render View 4 row-component hits as a compact markdown listing.
 
     Each row becomes a single block of `column: value` lines plus a header
@@ -221,6 +222,25 @@ def _row_hits_to_markdown(hits: List[Dict], max_rows: int = 8) -> str:
             lines.append(f"  {col}: {val}")
         out.append("\n".join(lines))
     return "\n\n".join(out)
+
+
+def _retrieve_row_context(
+    index: MultiviewIndex,
+    query: str,
+    chunks: List[Dict],
+    top_k: int = ROW_TOP_K,
+) -> str:
+    """Paper RETRIEVE primitive: rank exactly top-K rows against q_t."""
+    target_table = next(
+        (
+            chunk.get("table_id") or chunk.get("source")
+            for chunk in chunks
+            if chunk.get("type") == "table"
+        ),
+        None,
+    )
+    hits = index.retrieve_rows(query, top_k=top_k, table_id=target_table)
+    return _row_hits_to_markdown(hits, max_rows=top_k)
 
 def _table_chunks_to_markdown(chunks: List[Dict], max_chars: int = 4000) -> str:
     """#3+(b): concatenate table-type chunk text for verifier fusion.
@@ -914,25 +934,12 @@ class AgenticTableRAGAgent:
             # Prefer View 4 row-component (row-level) over View 2 (chunk-level)
             table_context = ""
             if getattr(self.index, "row_index", None) and self.index.row_index.entries:
-                # Restrict to table_id recovered from the table chunks when possible
-                target_table = None
-                for c in chunks:
-                    if c.get("type") == "table":
-                        target_table = c.get("table_id") or c.get("source")
-                        break
-                # Run query + entity-keyed retrievals for richer recall
-                hits: List[Dict] = []
-                seen = set()
-                for q in [sub_q.sub_query, *sub_q.entity_mentions]:
-                    if not q:
-                        continue
-                    for r in self.index.retrieve_rows(q, top_k=5, table_id=target_table):
-                        key = (r["table_id"], r["row_idx"])
-                        if key not in seen:
-                            seen.add(key)
-                            hits.append(r)
-                # Render rows as the new TABLE CONTEXT
-                table_context = _row_hits_to_markdown(hits, max_rows=8)
+                table_context = _retrieve_row_context(
+                    self.index,
+                    sub_q.sub_query,
+                    chunks,
+                    top_k=ROW_TOP_K,
+                )
 
             if not table_context:
                 table_context = _table_chunks_to_markdown(chunks)
@@ -990,7 +997,7 @@ class BatchRunner:
         self,
         data_file: str,
         save_file: str,
-        max_workers: int = 1,
+        max_workers: int = 2,
         rerun: bool = False,
         emit_trace: bool = False,
     ) -> None:
@@ -1101,7 +1108,12 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--require_cuda", action="store_true")
     parser.add_argument("--max_iter", type=int, default=MAX_ITER)
-    parser.add_argument("--max_workers", type=int, default=1)
+    parser.add_argument(
+        "--max_workers",
+        type=int,
+        default=2,
+        help="Parallel dataset-question workers; sub-queries stay sequential",
+    )
     parser.add_argument("--rerun", action="store_true")
     parser.add_argument(
         "--emit_trace", action="store_true",

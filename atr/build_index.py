@@ -22,6 +22,7 @@ import os
 import time
 
 from atr.clients.chat_utils import init_logger                    # noqa: E402
+from atr.config import CELL_INDEX_BUDGET                          # noqa: E402
 from atr.offline.multiview_index import (                 # noqa: E402
     DOCUMENT_CHUNK_OVERLAP,
     DOCUMENT_CHUNK_SIZE,
@@ -38,7 +39,7 @@ def main() -> None:
                         help="Directory containing bge-m3 model")
     parser.add_argument("--save_path", required=True,
                         help="Output path prefix (e.g. ./index/multiview)")
-    parser.add_argument("--budget", type=int, default=200_000,
+    parser.add_argument("--budget", type=int, default=CELL_INDEX_BUDGET,
                         help="Cell Index global budget B (§3.2 View 4). "
                              "safety cap on total entries across all tables")
     parser.add_argument("--per_table_quota", type=int, default=50,

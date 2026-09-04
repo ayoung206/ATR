@@ -1,6 +1,7 @@
 """Regression tests for the paper-aligned document chunk configuration."""
 from __future__ import annotations
 
+import inspect
 import pickle
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 from atr.offline.multiview_index import (
     DOCUMENT_CHUNK_OVERLAP,
     DOCUMENT_CHUNK_SIZE,
+    CellIndex,
     DocumentRetriever,
     MultiviewIndex,
 )
@@ -78,6 +80,16 @@ class DocumentChunkingTest(unittest.TestCase):
                 payload["document_chunk_config"],
                 {"size": 512, "overlap": 64, "unit": "tokens"},
             )
+
+    def test_cell_index_default_budget_matches_paper(self):
+        self.assertEqual(
+            inspect.signature(CellIndex).parameters["budget"].default,
+            10_000,
+        )
+        self.assertEqual(
+            inspect.signature(MultiviewIndex).parameters["budget"].default,
+            10_000,
+        )
 
 
 if __name__ == "__main__":

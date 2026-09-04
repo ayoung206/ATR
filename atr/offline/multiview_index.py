@@ -163,7 +163,7 @@ class CellIndex:
     def __init__(
         self,
         embedder: Embedder,
-        budget: int = 200_000,
+        budget: int = 10_000,
         per_table_quota: int = 50,
         reranker: Optional[CrossEncoderCandidateReranker] = None,
     ) -> None:
@@ -525,7 +525,7 @@ class MultiviewIndex:
         doc_dir: str,
         bge_model_path: str,
         save_path: str,
-        budget: int = 200_000,
+        budget: int = 10_000,
         per_table_quota: int = 50,
         device: str = "auto",
         require_cuda: bool = False,
@@ -672,7 +672,7 @@ class MultiviewIndex:
     def retrieve_rows(
         self,
         query: str,
-        top_k: int = 5,
+        top_k: int = 10,
         table_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Phase F-A: Row-level retrieval (View 4 (row component)).

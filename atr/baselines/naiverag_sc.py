@@ -8,7 +8,7 @@ for ATR: NaiveRAG = 1 LLM call/Q, ATR ≈ 5-9 LLM calls/Q, NaiveRAG-SC@5
 ≈ 5 LLM calls/Q: answers the "ATR just uses more compute" critique.
 
 Re-uses naiverag.naiverag_answer for retrieval + prompt construction, but
-bypasses chat_utils.get_chat_result (which hard-codes temperature=0.1) and
+bypasses chat_utils.get_chat_result (which uses ATR's greedy temperature=0) and
 calls the OpenAI-compatible API directly with custom temperature.
 
 Usage:
@@ -60,7 +60,7 @@ def _norm(s: str) -> str:
     return " ".join(s.split())
 
 def _make_sc_llm_fn(llm_config: Dict, temperature: float):
-    """Direct OpenAI client call so we can override temperature (chat_utils hard-codes 0.1).
+    """Direct OpenAI client call so we can override ATR's greedy temperature.
 
     Uses chat_utils._resolve_api_key so Vertex Gemini's OAuth2 flow works
     (service account → fresh access token). For pure OpenAI (gpt-4o-mini)
