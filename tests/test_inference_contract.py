@@ -106,7 +106,7 @@ class RetrievalProtocolTest(unittest.TestCase):
             expected_operator="lookup",
         )
 
-        answer, sql_result, route_evidence = agent._execute_route(
+        answer, sql_result, route_evidence, effective_route = agent._execute_route(
             sub_q=sub_q,
             original_question=sub_q.sub_query,
             schema=None,
@@ -119,9 +119,110 @@ class RetrievalProtocolTest(unittest.TestCase):
 
         self.assertEqual(answer, "Alpha FC")
         self.assertEqual(sql_result, "")
+        self.assertEqual(effective_route, Route.RETRIEVE)
         self.assertEqual(captured["table_context"], "[Table clubs, row 7]\n  Club: Alpha FC\n  Founded: 1971")
         self.assertIn(captured["table_context"], route_evidence)
         self.assertIn("Column: Club", route_evidence)
+
+    def test_value_linker_text_fallback_reports_effective_route(self):
+        class _Index:
+            def schema_cell_retrieval(self, **_kwargs):
+                return [], {}
+
+        class _Linker:
+            def link(self, **_kwargs):
+                return [SimpleNamespace(
+                    needs_reroute=True,
+                    is_matched=False,
+                    entity="entity",
+                    column="",
+                    matched_value=None,
+                )]
+
+        class _Verifier:
+            def answer_from_text(self, *_args, **_kwargs):
+                return "text answer"
+
+        agent = object.__new__(AgenticTableRAGAgent)
+        agent.index = _Index()
+        agent.value_linker = _Linker()
+        agent.verifier = _Verifier()
+        agent.no_value_linker = False
+        sub_q = SimpleNamespace(
+            sub_query="question",
+            entity_mentions=["entity"],
+        )
+
+        answer, sql_result, evidence, effective_route = agent._execute_route(
+            sub_q=sub_q,
+            original_question="question",
+            schema=None,
+            chunks=[],
+            text_evidence="text evidence",
+            route=Route.HYBRID,
+            sql_executor=object(),
+            H=[],
+        )
+
+        self.assertEqual(answer, "text answer")
+        self.assertEqual(sql_result, "")
+        self.assertEqual(evidence, "")
+        self.assertEqual(effective_route, Route.TEXT)
+
+    def test_failed_history_and_reselection_use_effective_route(self):
+        reselect_calls = []
+
+        class _Verifier:
+            def verify(self, **_kwargs):
+                return 0.0
+
+            def is_rejected(self, verdict):
+                return verdict < 1.0
+
+        class _Router:
+            def reselect(self, **kwargs):
+                reselect_calls.append(kwargs)
+                return Route.TEXT
+
+        agent = object.__new__(AgenticTableRAGAgent)
+        agent.verifier = _Verifier()
+        agent.router = _Router()
+        agent.no_escalation = False
+        agent.no_value_linker = False
+        agent._execute_route = lambda **_kwargs: (
+            "rejected text", "", "", Route.TEXT
+        )
+        sub_q = SimpleNamespace(
+            sub_query="current question",
+            expected_operator="lookup",
+            required_modalities="both",
+            entity_mentions=["entity"],
+            need_global_table_view=False,
+            uncertainty=0.2,
+        )
+        history = []
+        decisions = []
+
+        result = agent._execute_and_verify(
+            sub_q=sub_q,
+            original_question="question",
+            schema=None,
+            chunks=[],
+            route=Route.HYBRID,
+            sql_executor=object(),
+            H=history,
+            question_id="q1",
+            decisions=decisions,
+        )
+
+        self.assertEqual(result, ("rejected text", 0.5))
+        self.assertEqual(history[0]["route"], "TEXT")
+        self.assertEqual(history[0]["requested_route"], "HYBRID")
+        self.assertEqual(history[0]["effective_route"], "TEXT")
+        self.assertTrue(history[0]["value_linker_attempted"])
+        self.assertEqual(decisions[0]["route"], "TEXT")
+        self.assertEqual(decisions[0]["requested_route"], "HYBRID")
+        self.assertEqual(reselect_calls[0]["current_route"], Route.TEXT)
 
     def test_execute_and_verify_forwards_route_evidence(self):
         captured = {}
@@ -137,11 +238,13 @@ class RetrievalProtocolTest(unittest.TestCase):
 
         agent = object.__new__(AgenticTableRAGAgent)
         agent.no_escalation = True
+        agent.no_value_linker = False
         agent.verifier = _Verifier()
         agent._execute_route = lambda **_kwargs: (
             "Alpha FC",
             "",
             "[Table clubs, row 7]\n  Founded: 1971",
+            Route.RETRIEVE,
         )
 
         answer, confidence = agent._execute_and_verify(

@@ -196,6 +196,10 @@ Useful flags:
   Row indexing covers every source row by default, and a known table ID is
   enforced inside the FAISS search so global high-scoring rows cannot crowd
   the target table out of its top-10 result set.
+- Failure history records both the router's `requested_route` and the
+  `effective_route` that actually produced the answer. If ValueLinker falls
+  through from RETRIEVE/HYBRID to TEXT, re-routing excludes TEXT while the
+  current sub-query's ValueLinker fallback ladder still advances exactly once.
 - Non-reasoning backbones use temperature `0`. APIs that reject temperature
   (for example, reasoning-enabled models) receive only their supported controls.
 - `--decomposer_backbone <key>`: drive only the decomposer with another backbone (rest stays on `--backbone`); decomposer-model robustness in Table 4.

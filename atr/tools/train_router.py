@@ -255,6 +255,7 @@ def _execute_route_for_oracle(
         schema_columns=C,
         V_raw=V_raw,
         history_H=[],
+        current_sub_query=sub_q.sub_query,
     )
 
     schema_info = "\n".join(

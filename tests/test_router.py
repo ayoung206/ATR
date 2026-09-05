@@ -5,7 +5,14 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
-from atr.online.router import HeuristicRouter, LLMRouter, LearnedRouter, Route
+from atr.online.router import (
+    HeuristicRouter,
+    LLMRouter,
+    LearnedRouter,
+    Route,
+    _failed_route_names,
+    _history_feature,
+)
 from atr.tools.train_router import load_inference_oracle
 
 
@@ -128,6 +135,24 @@ class LearnedRouterTest(unittest.TestCase):
         )
 
         self.assertEqual(route, Route.RETRIEVE)
+
+    def test_history_uses_effective_route_and_preserves_requested_transition(self):
+        history = [{
+            "sub_query": "Which club was founded in 1971?",
+            "route": "TEXT",
+            "requested_route": "HYBRID",
+            "effective_route": "TEXT",
+            "verdict": 0.0,
+        }]
+
+        self.assertEqual(
+            _history_feature(history),
+            "Which club was founded in 1971? => HYBRID->TEXT:0.0",
+        )
+        self.assertEqual(
+            _failed_route_names(history, "Which club was founded in 1971?"),
+            {"TEXT"},
+        )
 
     def test_reselect_reinvokes_student_with_schema_and_failure_history(self):
         router = _router_with_logits([0.1, 0.8, 0.9, 0.3])

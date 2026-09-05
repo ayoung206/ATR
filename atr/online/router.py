@@ -106,15 +106,21 @@ def _history_feature(history_H: Optional[List[Dict[str, Any]]]) -> str:
     for item in history_H:
         if isinstance(item, dict):
             route = item.get("route")
+            requested_route = item.get("requested_route")
             verdict = item.get("verdict")
             failed_query = item.get("sub_query", "")
         else:
-            route, verdict, failed_query = item, None, ""
+            route, requested_route, verdict, failed_query = item, None, None, ""
         if isinstance(route, Route):
             route = route.value
+        if isinstance(requested_route, Route):
+            requested_route = requested_route.value
         if not route:
             continue
-        detail = str(route) if verdict is None else f"{route}:{verdict}"
+        route_label = str(route)
+        if requested_route and str(requested_route) != route_label:
+            route_label = f"{requested_route}->{route_label}"
+        detail = route_label if verdict is None else f"{route_label}:{verdict}"
         failures.append(f"{failed_query} => {detail}" if failed_query else detail)
     return ", ".join(failures) if failures else "none"
 

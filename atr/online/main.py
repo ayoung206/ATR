@@ -743,18 +743,32 @@ class AgenticTableRAGAgent:
         max_attempts = 1 if self.no_escalation else 4
 
         for attempt in range(max_attempts):
-            logger.info(f"[{question_id}] Executing route={route.value} (attempt {attempt+1})")
+            requested_route = route
+            logger.info(
+                f"[{question_id}] Executing route={requested_route.value} "
+                f"(attempt {attempt+1})"
+            )
 
-            y_t, sql_result, route_evidence = self._execute_route(
+            y_t, sql_result, route_evidence, effective_route = self._execute_route(
                 sub_q=sub_q,
                 original_question=original_question,
                 schema=schema,
                 chunks=chunks,
                 text_evidence=text_evidence,
-                route=route,
+                route=requested_route,
                 sql_executor=sql_executor,
                 H=H,
             )
+            value_linker_attempted = (
+                requested_route in (Route.RETRIEVE, Route.HYBRID)
+                and not self.no_value_linker
+                and bool(getattr(sub_q, "entity_mentions", None))
+            )
+            if effective_route != requested_route:
+                logger.info(
+                    f"[{question_id}] Effective route: "
+                    f"{requested_route.value} → {effective_route.value}"
+                )
             if oracle_candidates is not None and y_t:
                 oracle_candidates.append(y_t)
 
@@ -782,7 +796,10 @@ class AgenticTableRAGAgent:
                     "schema": schema,
                     "has_schema": bool(schema),
                     "history_H": [dict(item) for item in H],
-                    "route": route.value,
+                    "route": effective_route.value,
+                    "requested_route": requested_route.value,
+                    "effective_route": effective_route.value,
+                    "value_linker_attempted": value_linker_attempted,
                     "attempt": attempt + 1,
                     "verdict": verdict,
                     "accepted": not self.verifier.is_rejected(verdict),
@@ -797,14 +814,15 @@ class AgenticTableRAGAgent:
                 logger.info(f"[{question_id}] no_escalation=True → returning first-route answer")
                 break
 
-            # Record failure and escalate. The history uses the route's *string
-            # value* so downstream router code can compare against `Route.value`
-            # consistently; the previous mix of enum and string caused
-            # `r.get("route")` to mismatch and effectively skip the
-            # failed-routes filter on retries.
+            # Record the primitive that actually produced the rejected answer.
+            # Keep the router's request separately because ValueLinker may turn
+            # RETRIEVE/HYBRID into an immediate TEXT fallback.
             H.append({
                 "sub_query": sub_q.sub_query,
-                "route": route.value,
+                "route": effective_route.value,
+                "requested_route": requested_route.value,
+                "effective_route": effective_route.value,
+                "value_linker_attempted": value_linker_attempted,
                 "verdict": verdict,
                 "step": len(H) + 1,
             })
@@ -813,9 +831,9 @@ class AgenticTableRAGAgent:
                 meta=sub_q,
                 schema=schema,
                 history_H=H,
-                current_route=route,
+                current_route=effective_route,
             )
-            if new_route == route:
+            if new_route == effective_route:
                 # Terminal: TEXT and already tried
                 break
             route = new_route
@@ -832,12 +850,12 @@ class AgenticTableRAGAgent:
         route: Route,
         sql_executor: ConstrainedSQLExecutor,
         H: List[Dict],
-    ) -> Tuple[str, str, str]:
+    ) -> Tuple[str, str, str, Route]:
         """
         Execute a single route.
-        Returns (answer, sql_result, route_evidence_text). The final value is
-        the evidence actually used to produce the answer, so verification sees
-        the same grounding context as the execution primitive.
+        Returns (answer, sql_result, route_evidence_text, effective_route).
+        The evidence and effective route describe the primitive that actually
+        produced the answer, including ValueLinker's TEXT fallback.
         """
         sql_result = ""
         schema_cell_ev = ""
@@ -847,7 +865,7 @@ class AgenticTableRAGAgent:
             y_t = self.verifier.answer_from_text(
                 sub_q.sub_query, text_evidence, original_question=original_question
             )
-            return y_t, sql_result, schema_cell_ev
+            return y_t, sql_result, schema_cell_ev, Route.TEXT
 
         # ── SQL (Lines 16–17) ────────────────────────────────────────────────
         if route == Route.SQL:
@@ -888,7 +906,7 @@ class AgenticTableRAGAgent:
                 table_chunks_md=_table_chunks_to_markdown(chunks),
                 legacy_fast_path=self.legacy_fast_path,
             )
-            return y_t, sql_result, schema_evidence
+            return y_t, sql_result, schema_evidence, Route.SQL
 
         # ── RETRIEVE / HYBRID: Schema + Cell retrieval first ─────────────────
         C, V_raw = self.index.schema_cell_retrieval(
@@ -910,6 +928,7 @@ class AgenticTableRAGAgent:
                 schema_columns=C,
                 V_raw=V_raw,
                 history_H=H,
+                current_sub_query=sub_q.sub_query,
             )
 
         schema_cell_ev = "\n".join([
@@ -923,7 +942,7 @@ class AgenticTableRAGAgent:
             y_t = self.verifier.answer_from_text(
                 sub_q.sub_query, text_evidence, original_question=original_question
             )
-            return y_t, sql_result, ""
+            return y_t, sql_result, "", Route.TEXT
 
         # ── RETRIEVE (Lines 12–15) ───────────────────────────────────────────
         # Phase F-A (Option A): pass View 4 row-component (RowIndex) rows to the synthesis
@@ -957,7 +976,7 @@ class AgenticTableRAGAgent:
             route_evidence = "\n\n".join(
                 filter(None, [schema_info, cell_info, table_context])
             )
-            return y_t, sql_result, route_evidence
+            return y_t, sql_result, route_evidence, Route.RETRIEVE
 
         # ── HYBRID (Lines 18–21) ─────────────────────────────────────────────
         # D1 + E8 augmentation: arithmetic hint + type hint on the sub_query
@@ -988,7 +1007,7 @@ class AgenticTableRAGAgent:
             table_chunks_md=_table_chunks_to_markdown(chunks),
             legacy_fast_path=self.legacy_fast_path,
         )
-        return y_t, sql_result, schema_cell_ev
+        return y_t, sql_result, schema_cell_ev, Route.HYBRID
 
 class BatchRunner:
     """

@@ -15,6 +15,39 @@ NO_MATCH = "no_match"
 # Routes that require value linking (used to interpret history_H)
 _VL_ROUTES = {"HYBRID", "RETRIEVE"}
 
+
+def _route_name(route: Any) -> str:
+    value = getattr(route, "value", route)
+    return str(value or "").upper()
+
+
+def _prior_value_linker_failures(
+    history_H: List[Dict[str, Any]],
+    current_sub_query: str,
+) -> int:
+    """Count rejected attempts that actually invoked linking for this q_t."""
+    count = 0
+    for item in history_H or []:
+        if not isinstance(item, dict):
+            if _route_name(item) in _VL_ROUTES:
+                count += 1
+            continue
+
+        failed_query = str(item.get("sub_query", "") or "")
+        if current_sub_query and failed_query and failed_query != current_sub_query:
+            continue
+
+        attempted = item.get("value_linker_attempted")
+        if attempted is not None:
+            count += int(bool(attempted))
+            continue
+
+        # Backward compatibility for traces written before the explicit flag.
+        route = item.get("requested_route") or item.get("route")
+        if _route_name(route) in _VL_ROUTES:
+            count += 1
+    return count
+
 def _parse_json(text: str) -> Dict[str, Any]:
     text = text.strip()
     try:
@@ -88,6 +121,7 @@ class HybridValueLinker:
         schema_columns: List[Dict[str, Any]],
         V_raw: Dict[str, List[Dict[str, Any]]],
         history_H: List[Dict[str, Any]],
+        current_sub_query: str = "",
     ) -> List[LinkedValue]:
         """
         For each entity mention, run Stage 1 (already done → V_raw) then Stage 2 (LLM).
@@ -96,29 +130,22 @@ class HybridValueLinker:
             entity_mentions:  list of entity strings from the sub-query
             schema_columns:   retrieved schema column entries (View 3)
             V_raw:            {entity: [cell candidates]} from View 4 Stage 1
-            history_H:        failure history: used to escalate min_fallback_level
-                              so already-failed linking strategies are skipped
+            history_H:        rejected execution attempts
+            current_sub_query: q_t used to scope history to the active sub-query
 
         Returns:
             List of LinkedValue objects.
         """
-        # §3.5 "skip already-failed attempts":
-        # count how many routes requiring value linking have already failed
-        prior_vl_failures = sum(
-            1 for r in history_H
-            if str(r.get("route", "")) in _VL_ROUTES
+        prior_vl_failures = _prior_value_linker_failures(
+            history_H, current_sub_query
         )
-        # Gradual escalation, keyed on how many times linking has already failed.
-        # 0 failures → start at level 0 (strict match first)
-        # 1 failure  → start at level 1 (skip strict, try unconstrained SQL)
-        # 2 failures → start at level 2 (try fuzzy LIKE)
-        # 3+ failures → start at level 3 (reroute to TEXT)
-        # The previous `* 2` doubling caused the first VL failure to skip past
-        # fuzzy-LIKE entirely, missing legitimate fuzzy matches that would
-        # have rescued the route on retry.
-        min_fallback = min(prior_vl_failures, 3)
+        # A fresh no-match uses level 1. Each rejected attempt that actually
+        # ran the linker advances exactly one step: unconstrained → fuzzy →
+        # reroute. Unrelated sub-queries and SQL/TEXT-only failures do not
+        # consume this fallback ladder.
+        min_fallback = min(prior_vl_failures + 1, 3)
 
-        if min_fallback > 0:
+        if prior_vl_failures > 0:
             logger.debug(
                 f"ValueLinker: {prior_vl_failures} prior VL failure(s) → "
                 f"min_fallback={min_fallback}"
@@ -146,9 +173,8 @@ class HybridValueLinker:
     ) -> LinkedValue:
         """Stage 2: LLM verification for a single entity (multi-column aware)."""
         if not candidates:
-            fallback = max(min_fallback, 1)
-            logger.debug(f"No candidates for entity '{entity}' → fallback level {fallback}")
-            return LinkedValue(entity, "", None, 0.0, fallback_level=fallback)
+            logger.debug(f"No candidates for entity '{entity}'")
+            return self._apply_fallback(entity, "", [], min_fallback)
 
         # Build schema lookup for quick type/examples access
         schema_by_col: Dict[str, Dict] = {c["col_name"]: c for c in schema_columns}
@@ -186,8 +212,10 @@ class HybridValueLinker:
             response_text = self.llm_fn(messages)
         except Exception as exc:
             logger.error(f"ValueLinker LLM call failed: {exc}")
-            fallback = max(min_fallback, 1)
-            return LinkedValue(entity, primary_col, None, 0.0, fallback_level=fallback)
+            candidate_values = [c.get("value", "") for c in candidates]
+            return self._apply_fallback(
+                entity, primary_col, candidate_values, min_fallback
+            )
 
         parsed = _parse_json(response_text)
         matched_value: str = parsed.get("matched_value", NO_MATCH)
