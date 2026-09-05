@@ -58,9 +58,10 @@ class LinkedValue:
         """Build a SQL WHERE snippet for this linked value."""
         if not self.is_matched:
             return ""
+        escaped_value = str(self.matched_value).replace("'", "''")
         if self.fallback_level == 2:
-            return f"{self.column} LIKE '%{self.matched_value}%'"
-        return f"{self.column} = '{self.matched_value}'"
+            return f"{self.column} LIKE '%{escaped_value}%'"
+        return f"{self.column} = '{escaped_value}'"
 
 class HybridValueLinker:
     """

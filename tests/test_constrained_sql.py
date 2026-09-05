@@ -40,6 +40,7 @@ class SQLConstraintValidationTest(unittest.TestCase):
         for invalid_sql in (
             "SELECT Club FROM clubs WHERE City = 'Saint Etienne'",
             "SELECT Club FROM clubs WHERE City LIKE '%Saint-Etienne%'",
+            "SELECT Club FROM clubs WHERE City LIKE '%Saint Etienne%' OR 1 = 1",
         ):
             violations = subject.validate_sql_constraints(
                 invalid_sql,
@@ -60,6 +61,64 @@ class SQLConstraintValidationTest(unittest.TestCase):
             [_binding()],
         )
         self.assertEqual(violations, [])
+
+    def test_exact_binding_requires_mandatory_direct_equality(self):
+        invalid_queries = (
+            "SELECT Club FROM clubs WHERE Founded != '1971'",
+            "SELECT Club FROM clubs WHERE Founded > '1971'",
+            "SELECT Club FROM clubs WHERE Founded LIKE '1971'",
+            "SELECT Club FROM clubs WHERE Founded IN ('1971', '1972')",
+            "SELECT Club FROM clubs WHERE Founded = '1971' OR 1 = 1",
+            "SELECT Club FROM clubs "
+            "WHERE CASE WHEN Founded = '1971' THEN 1 ELSE 1 END = 1",
+            "SELECT Club FROM clubs WHERE EXISTS "
+            "(SELECT 1 FROM clubs WHERE Founded = '1971')",
+        )
+        for sql in invalid_queries:
+            with self.subTest(sql=sql):
+                violations = subject.validate_sql_constraints(
+                    sql,
+                    ["Club", "Founded"],
+                    ["clubs"],
+                    [_binding()],
+                )
+                self.assertTrue(
+                    any("missing exact WHERE binding" in v for v in violations),
+                    violations,
+                )
+
+    def test_accepts_all_exact_bindings_joined_by_and(self):
+        city = LinkedValue("Paris", "City", "Paris", 1.0)
+        violations = subject.validate_sql_constraints(
+            "SELECT Club FROM clubs "
+            "WHERE Founded = '1971' AND City = 'Paris'",
+            ["Club", "Founded", "City"],
+            ["clubs"],
+            [_binding(), city],
+        )
+        self.assertEqual(violations, [])
+
+    def test_requires_an_allowed_table_reference(self):
+        violations = subject.validate_sql_constraints(
+            "SELECT Founded WHERE Founded = '1971'",
+            ["Founded"],
+            ["clubs"],
+            [_binding()],
+        )
+        self.assertIn("query does not reference an allowed table", violations)
+
+    def test_sql_literal_is_escaped_in_prompt_binding(self):
+        binding = LinkedValue("O'Reilly", "Publisher", "O'Reilly", 1.0)
+        self.assertEqual(binding.to_where_clause(), "Publisher = 'O''Reilly'")
+        self.assertEqual(
+            subject.validate_sql_constraints(
+                "SELECT Title FROM books WHERE Publisher = 'O''Reilly'",
+                ["Title", "Publisher"],
+                ["books"],
+                [binding],
+            ),
+            [],
+        )
 
     def test_rejects_disallowed_sql_and_missing_binding(self):
         violations = subject.validate_sql_constraints(
@@ -153,6 +212,38 @@ class ConstrainedSQLExecutorTest(unittest.TestCase):
             subject.get_excel_rag_response_plain = original
 
         self.assertEqual(result, ("not found", 0.0))
+
+    def test_repairs_non_equality_that_only_mentions_the_exact_value(self):
+        responses = iter([
+            {
+                "sql_str": "SELECT Club FROM clubs WHERE Founded != '1971'",
+                "sql_execution_result": "Wrong FC",
+            },
+            {
+                "sql_str": "SELECT Club FROM clubs WHERE Founded = '1971'",
+                "sql_execution_result": "Alpha FC",
+            },
+        ])
+        prompts = []
+
+        def fake_service(**kwargs):
+            prompts.append(kwargs["query"])
+            return next(responses)
+
+        original = subject.get_excel_rag_response_plain
+        subject.get_excel_rag_response_plain = fake_service
+        try:
+            result = subject.ConstrainedSQLExecutor(["clubs"]).execute(
+                "Which club was founded in 1971?",
+                self.schema,
+                self.columns,
+                [_binding()],
+            )
+        finally:
+            subject.get_excel_rag_response_plain = original
+
+        self.assertEqual(result, ("Alpha FC", 1.0))
+        self.assertIn("missing exact WHERE binding", prompts[1])
 
     def test_refuses_to_call_service_without_column_constraint(self):
         called = []

@@ -113,6 +113,8 @@ def validate_sql_constraints(
     disallowed_tables = sorted(used_tables - allowed_table_set)
     if disallowed_tables:
         violations.append(f"disallowed tables: {', '.join(disallowed_tables)}")
+    if not (used_tables & allowed_table_set):
+        violations.append("query does not reference an allowed table")
 
     aliases = {
         _normalise_identifier(selection.alias)
@@ -135,51 +137,86 @@ def validate_sql_constraints(
     if not (used_columns & allowed_column_set) and not stars:
         violations.append("query does not reference an allowed column")
 
-    where_nodes = list(tree.find_all(exp.Where))
+    # A grounded value is a hard row constraint, not merely a token that may
+    # appear somewhere in the AST. Only a direct predicate in the outer WHERE
+    # can satisfy V*: exact bindings require `column = literal`, fuzzy bindings
+    # require `column LIKE literal`, and the predicate must stay on an AND-only
+    # path to WHERE so OR/NOT/CASE cannot make it optional.
+    outer_where = tree.args.get("where") if isinstance(tree, exp.Select) else None
+
+    def _literal_value(node: Any) -> Optional[str]:
+        if isinstance(node, exp.Literal):
+            return str(node.this)
+        if isinstance(node, exp.Neg) and isinstance(node.this, exp.Literal):
+            return f"-{node.this.this}"
+        return None
+
+    def _mandatory_in_outer_where(predicate: Any) -> bool:
+        if outer_where is None:
+            return False
+        node = predicate.parent
+        while node is not None and node is not outer_where:
+            if not isinstance(node, (exp.And, exp.Paren)):
+                return False
+            node = node.parent
+        return node is outer_where
+
+    def _matches_exact(predicate: Any, column: str, value: str) -> bool:
+        if not isinstance(predicate, exp.EQ) or not _mandatory_in_outer_where(predicate):
+            return False
+        left_column = (
+            _normalise_identifier(predicate.this.name)
+            if isinstance(predicate.this, exp.Column) else None
+        )
+        right_column = (
+            _normalise_identifier(predicate.expression.name)
+            if isinstance(predicate.expression, exp.Column) else None
+        )
+        left_value = _literal_value(predicate.this)
+        right_value = _literal_value(predicate.expression)
+        return (
+            left_column == column and right_value == value
+        ) or (
+            right_column == column and left_value == value
+        )
+
+    def _matches_fuzzy(predicate: Any, column: str, pattern: str) -> bool:
+        return (
+            isinstance(predicate, exp.Like)
+            and _mandatory_in_outer_where(predicate)
+            and isinstance(predicate.this, exp.Column)
+            and _normalise_identifier(predicate.this.name) == column
+            and _literal_value(predicate.expression) == pattern
+        )
+
+    predicates = list(outer_where.find_all(exp.Predicate)) if outer_where else []
     for linked in linked_values:
         if not linked.is_matched or linked.matched_value is None:
             continue
         wanted_column = _normalise_identifier(linked.column)
         wanted_value = str(linked.matched_value)
         expected_fuzzy_pattern = f"%{wanted_value}%"
-        binding_found = False
-        for where in where_nodes:
-            for predicate in where.find_all(exp.Predicate):
-                predicate_columns = {
-                    _normalise_identifier(column.name)
-                    for column in predicate.find_all(exp.Column)
-                }
-                literal_values = [
-                    str(literal.this) for literal in predicate.find_all(exp.Literal)
-                ]
-                if wanted_column not in predicate_columns:
-                    continue
-                if linked.fallback_level == 2:
-                    # Fuzzy fallback is a distinct, paper-defined weakening
-                    # level.  An equality predicate would silently turn it
-                    # back into an exact match, so require both the LIKE AST
-                    # node and the canonical linked value with wildcards.
-                    if (
-                        isinstance(predicate, exp.Like)
-                        and expected_fuzzy_pattern in literal_values
-                    ):
-                        binding_found = True
-                        break
-                    continue
-                if wanted_value in literal_values:
-                    binding_found = True
-                    break
-            if binding_found:
-                break
+        if linked.fallback_level == 2:
+            binding_found = any(
+                _matches_fuzzy(predicate, wanted_column, expected_fuzzy_pattern)
+                for predicate in predicates
+            )
+        else:
+            binding_found = any(
+                _matches_exact(predicate, wanted_column, wanted_value)
+                for predicate in predicates
+            )
         if not binding_found:
             if linked.fallback_level == 2:
                 violations.append(
                     "missing fuzzy LIKE binding: "
-                    f"{linked.column} LIKE {expected_fuzzy_pattern!r}"
+                    f"{linked.column} LIKE {expected_fuzzy_pattern!r} "
+                    "as a mandatory outer WHERE predicate"
                 )
             else:
                 violations.append(
-                    f"missing exact WHERE binding: {linked.column}={wanted_value!r}"
+                    f"missing exact WHERE binding: {linked.column}={wanted_value!r} "
+                    "as a mandatory equality predicate"
                 )
     return violations
 

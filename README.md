@@ -50,9 +50,11 @@ python -m atr.smoke               # 5-check install verification (~10 s)
 
    ATR validates every returned SQL statement with an AST gate before using
    its result: only one read-only `SELECT` is accepted, referenced tables and
-   columns must belong to the retrieved constraints, and every grounded
-   value binding must occur in its column's `WHERE` predicate. Invalid SQL is
-   repaired without relaxing `C` or `V*`; exhausted repairs fail closed.
+   columns must belong to the retrieved constraints, and every exact grounded
+   value must be a mandatory `column = value` predicate in the outer `WHERE`.
+   `OR`, `NOT`, another comparison operator, or a nested occurrence cannot
+   satisfy the binding. Invalid SQL is repaired without relaxing `C` or `V*`;
+   exhausted repairs fail closed.
 
    You can run ATR without the SQL service if you only need the `TEXT` / `RETRIEVE` routes (the router will degrade gracefully).
 4. **(Optional) Official TAT-QA evaluator**, needed only for Recipe B's EM/F1 numbers:

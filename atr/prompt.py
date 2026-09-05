@@ -264,8 +264,10 @@ Retrieval evidence (schema/cell context for reference):
 
 SQL generation rules:
   1. Refer only to the allowed columns listed above.
-  2. If a value binding is provided for a column, use the exact bound value in the
-     WHERE clause (do not paraphrase or look up alternatives).
+  2. Copy every value binding into the outer WHERE clause exactly as written:
+     preserve `column = value` as direct equality and `column LIKE pattern` as
+     LIKE. Join multiple bindings with AND. Never replace them with !=, <, >,
+     IN, OR, NOT, CASE, or a predicate in a nested sub-query.
   3. If value_bindings is "(none)", generate the most plausible WHERE clause
      from the query text alone, or omit WHERE if uncertain. If bindings are
      present, every binding is mandatory and must never be relaxed on retry.
