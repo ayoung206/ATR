@@ -159,10 +159,13 @@ python -m atr.build_index \
 
 Index construction only needs `<bge_dir>/bge-m3/`. Online retrieval recalls
 six times the requested result count with BGE-M3, then reranks the candidates
-for Views 1--4 with `<bge_dir>/bge-reranker-v2-m3/`. Existing indices do not
-need rebuilding for reranking alone. Document chunks use the BGE-M3 tokenizer
-with the paper settings of 512 tokens and 64-token overlap. Indices built before
-this setting was introduced must be rebuilt; loading one emits a warning.
+for Views 1--4 with `<bge_dir>/bge-reranker-v2-m3/`. Document chunks use the
+BGE-M3 tokenizer with the paper settings of 512 tokens and 64-token overlap.
+The loader validates the saved format version, build settings, metadata counts,
+and every FAISS component before loading model weights. Legacy or partially
+rebuilt indices fail closed with a rebuild instruction; they are never silently
+treated as current indices. A current-format index does not need rebuilding for
+reranking alone.
 
 ### 2. Run online inference (Algorithm 1)
 

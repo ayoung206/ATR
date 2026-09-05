@@ -1,5 +1,5 @@
 """
-Phase F-A: incrementally add View 6 (RowIndex) to an existing MultiviewIndex.
+Phase F-A: rebuild the row component of a current-format MultiviewIndex.
 
 Strategy: load the existing index payload (which already has table chunks +
 schemas + cells encoded), re-scan the excel dir to extract row-level dicts,
@@ -7,6 +7,8 @@ encode them with the same BGE-M3 embedder, and save a new variant of the
 index with the additional `.row.faiss` and `row_entries` payload.
 
 Skips re-encoding the doc/schema/cell views, only the new RowIndex is built.
+Legacy indices are intentionally rejected by ``MultiviewIndex.load``; rebuild
+all views with ``build_index.py`` instead of using this script to migrate one.
 
 Usage:
   python scripts/build_row_index.py \\

@@ -21,6 +21,209 @@ logger = logging.getLogger(__name__)
 DOCUMENT_CHUNK_SIZE = 512
 DOCUMENT_CHUNK_OVERLAP = 64
 DOCUMENT_CHUNK_UNIT = "tokens"
+INDEX_FORMAT_VERSION = 2
+
+
+class IncompatibleIndexError(RuntimeError):
+    """Raised when saved index artifacts do not satisfy the current contract."""
+
+
+def _rebuild_error(save_path: str, violations: List[str]) -> IncompatibleIndexError:
+    details = "\n".join(f"  - {violation}" for violation in violations)
+    return IncompatibleIndexError(
+        f"MultiviewIndex at {save_path!r} is incompatible with the current "
+        f"ATR index format:\n{details}\n"
+        "Rebuild every component together with build_index.py before running "
+        "inference. Mixing legacy metadata and FAISS files is not supported."
+    )
+
+
+def _validate_index_payload(save_path: str, payload: Dict[str, Any]) -> None:
+    """Validate metadata before loading embedding or reranker models.
+
+    Legacy payloads are rejected rather than relabelled with current defaults.
+    That keeps old character chunks, missing row indices, and over-budget cell
+    indices from silently participating in paper-aligned runs.
+    """
+    if not isinstance(payload, dict):
+        raise _rebuild_error(save_path, ["metadata payload must be a dict"])
+
+    violations: List[str] = []
+    if payload.get("index_format_version") != INDEX_FORMAT_VERSION:
+        violations.append(
+            "missing or unsupported index_format_version "
+            f"(expected {INDEX_FORMAT_VERSION}, got "
+            f"{payload.get('index_format_version')!r})"
+        )
+
+    required_lists = (
+        "doc_chunks",
+        "doc_source",
+        "doc_type",
+        "schema_entries",
+        "cell_entries",
+        "row_entries",
+    )
+    for key in required_lists:
+        if not isinstance(payload.get(key), list):
+            violations.append(f"metadata field {key!r} must be a list")
+    if not isinstance(payload.get("doc_schema_map"), dict):
+        violations.append("metadata field 'doc_schema_map' must be a dict")
+    if not isinstance(payload.get("table_schemas"), dict):
+        violations.append("metadata field 'table_schemas' must be a dict")
+
+    chunk_config = payload.get("document_chunk_config")
+    expected_chunk_config = {
+        "size": DOCUMENT_CHUNK_SIZE,
+        "overlap": DOCUMENT_CHUNK_OVERLAP,
+        "unit": DOCUMENT_CHUNK_UNIT,
+    }
+    if chunk_config != expected_chunk_config:
+        violations.append(
+            "document_chunk_config must be the paper configuration "
+            f"{expected_chunk_config!r}, got {chunk_config!r}"
+        )
+
+    build_config = payload.get("index_build_config")
+    if not isinstance(build_config, dict):
+        violations.append("missing index_build_config")
+        build_config = {}
+    elif build_config.get("document_chunks") != chunk_config:
+        violations.append(
+            "index_build_config.document_chunks does not match "
+            "document_chunk_config"
+        )
+
+    cell_config = build_config.get("cell_index", {})
+    row_config = build_config.get("row_index", {})
+    for name, config in (("cell_index", cell_config), ("row_index", row_config)):
+        if not isinstance(config, dict):
+            violations.append(f"index_build_config.{name} must be a dict")
+
+    doc_chunks = payload.get("doc_chunks", [])
+    doc_sources = payload.get("doc_source", [])
+    doc_types = payload.get("doc_type", [])
+    if all(isinstance(items, list) for items in (doc_chunks, doc_sources, doc_types)):
+        if not (len(doc_chunks) == len(doc_sources) == len(doc_types)):
+            violations.append(
+                "doc_chunks, doc_source, and doc_type lengths must match"
+            )
+        schema_map = payload.get("doc_schema_map", {})
+        if isinstance(schema_map, dict):
+            invalid_chunk_ids = [
+                chunk_id
+                for chunk_id in schema_map
+                if not isinstance(chunk_id, int)
+                or chunk_id < 0
+                or chunk_id >= len(doc_chunks)
+            ]
+            if invalid_chunk_ids:
+                violations.append("doc_schema_map contains out-of-range chunk ids")
+            missing_table_maps = [
+                index
+                for index, chunk_type in enumerate(doc_types)
+                if chunk_type == "table" and index not in schema_map
+            ]
+            if missing_table_maps:
+                violations.append("one or more table chunks lack schema mappings")
+
+    cell_entries = payload.get("cell_entries", [])
+    row_entries = payload.get("row_entries", [])
+    table_schemas = payload.get("table_schemas", {})
+    cell_budget = cell_config.get("budget") if isinstance(cell_config, dict) else None
+    cell_quota = (
+        cell_config.get("per_table_quota") if isinstance(cell_config, dict) else None
+    )
+    row_budget = row_config.get("budget") if isinstance(row_config, dict) else None
+    row_quota = (
+        row_config.get("per_table_quota") if isinstance(row_config, dict) else None
+    )
+    row_max_chars = (
+        row_config.get("max_row_chars") if isinstance(row_config, dict) else None
+    )
+    for name, value in (
+        ("cell_index.budget", cell_budget),
+        ("cell_index.per_table_quota", cell_quota),
+        ("row_index.budget", row_budget),
+        ("row_index.per_table_quota", row_quota),
+        ("row_index.max_row_chars", row_max_chars),
+    ):
+        if not isinstance(value, int) or value <= 0:
+            violations.append(f"index_build_config.{name} must be a positive integer")
+    if not isinstance(build_config.get("embedding_model"), str) or not build_config.get(
+        "embedding_model"
+    ):
+        violations.append("index_build_config.embedding_model must be a non-empty string")
+
+    if isinstance(cell_entries, list) and isinstance(cell_budget, int):
+        if len(cell_entries) > cell_budget:
+            violations.append(
+                f"cell entry count {len(cell_entries)} exceeds recorded budget {cell_budget}"
+            )
+    if isinstance(row_entries, list) and isinstance(row_budget, int):
+        if len(row_entries) > row_budget:
+            violations.append(
+                f"row entry count {len(row_entries)} exceeds recorded budget {row_budget}"
+            )
+    if isinstance(table_schemas, dict) and table_schemas and not row_entries:
+        violations.append("table schemas exist but the required row index is empty")
+
+    for label, entries, quota in (
+        ("cell", cell_entries, cell_quota),
+        ("row", row_entries, row_quota),
+    ):
+        if not isinstance(entries, list) or not isinstance(quota, int) or quota <= 0:
+            continue
+        counts = Counter(entry.get("table_id") for entry in entries if isinstance(entry, dict))
+        if any(count > quota for count in counts.values()):
+            violations.append(f"{label} entries exceed the recorded per-table quota")
+
+    if violations:
+        raise _rebuild_error(save_path, violations)
+
+
+def _load_validated_faiss_indices(
+    save_path: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Optional[faiss.Index]]:
+    """Load FAISS components once and verify their cardinality and dimensions."""
+    specifications = {
+        "doc": len(payload["doc_chunks"]),
+        "schema": len(payload["schema_entries"]),
+        "cell": len(payload["cell_entries"]),
+        "row": len(payload["row_entries"]),
+    }
+    loaded: Dict[str, Optional[faiss.Index]] = {}
+    violations: List[str] = []
+    dimensions = set()
+    for component, expected_count in specifications.items():
+        path = f"{save_path}.{component}.faiss"
+        if not os.path.exists(path):
+            loaded[component] = None
+            if expected_count:
+                violations.append(
+                    f"missing {component} FAISS file for {expected_count} metadata entries"
+                )
+            continue
+        try:
+            index = faiss.read_index(path)
+        except Exception as exc:
+            loaded[component] = None
+            violations.append(f"cannot read {component} FAISS file: {exc}")
+            continue
+        loaded[component] = index
+        if index.ntotal != expected_count:
+            violations.append(
+                f"{component} FAISS count {index.ntotal} does not match "
+                f"metadata count {expected_count}"
+            )
+        if index.ntotal:
+            dimensions.add(index.d)
+    if len(dimensions) > 1:
+        violations.append(f"FAISS component dimensions disagree: {sorted(dimensions)}")
+    if violations:
+        raise _rebuild_error(save_path, violations)
+    return loaded
 
 
 def _schema_entry_to_text(entry: Dict[str, Any]) -> str:
@@ -720,6 +923,7 @@ class MultiviewIndex:
     def save(self) -> None:
         os.makedirs(os.path.dirname(self.save_path) or ".", exist_ok=True)
         payload = {
+            "index_format_version": INDEX_FORMAT_VERSION,
             "doc_chunks": self.doc_retriever.chunks,
             "doc_source": self.doc_retriever.chunk_source,
             "doc_type": self.doc_retriever.chunk_type,
@@ -728,6 +932,25 @@ class MultiviewIndex:
                 "size": self.doc_retriever.chunk_size,
                 "overlap": self.doc_retriever.chunk_overlap,
                 "unit": self.doc_retriever.chunk_unit,
+            },
+            "index_build_config": {
+                "document_chunks": {
+                    "size": self.doc_retriever.chunk_size,
+                    "overlap": self.doc_retriever.chunk_overlap,
+                    "unit": self.doc_retriever.chunk_unit,
+                },
+                "cell_index": {
+                    "budget": self.cell_index.budget,
+                    "per_table_quota": self.cell_index.per_table_quota,
+                },
+                "row_index": {
+                    "budget": self.row_index.budget,
+                    "per_table_quota": self.row_index.per_table_quota,
+                    "max_row_chars": self.row_index.max_row_chars,
+                },
+                "embedding_model": os.path.basename(
+                    os.path.normpath(getattr(self, "bge_model_path", ""))
+                ),
             },
             "schema_entries": self.schema_index.entries,
             "cell_entries": self.cell_index.entries,
@@ -769,6 +992,9 @@ class MultiviewIndex:
         with open(save_path + ".meta.pkl", "rb") as f:
             payload = pickle.load(f)
 
+        _validate_index_payload(save_path, payload)
+        faiss_indices = _load_validated_faiss_indices(save_path, payload)
+
         embedder = Embedder(bge_model_path, device=device, require_cuda=require_cuda)
         reranker = None
         if enable_reranker:
@@ -786,29 +1012,12 @@ class MultiviewIndex:
         instance.embedder = embedder
         instance.reranker = reranker
         instance.save_path = save_path
+        instance.bge_model_path = bge_model_path
         instance.table_schemas = payload["table_schemas"]
 
-        # Restore DocumentRetriever (Views 1+2). Legacy payloads contain
-        # character-based 1000/200 chunks and must be rebuilt for paper parity.
+        # Restore DocumentRetriever (Views 1+2). Compatibility was validated
+        # before loading the heavyweight embedding/reranker models.
         chunk_config = payload.get("document_chunk_config")
-        if chunk_config is None:
-            logger.warning(
-                "Index %s predates token-based 512/64 document chunking; "
-                "rebuild it with build_index.py for paper-aligned retrieval.",
-                save_path,
-            )
-            chunk_config = {
-                "size": DOCUMENT_CHUNK_SIZE,
-                "overlap": DOCUMENT_CHUNK_OVERLAP,
-                "unit": DOCUMENT_CHUNK_UNIT,
-            }
-        elif chunk_config.get("unit") != DOCUMENT_CHUNK_UNIT:
-            logger.warning(
-                "Index %s uses document chunk unit %r rather than tokens; "
-                "rebuild it for paper-aligned retrieval.",
-                save_path,
-                chunk_config.get("unit"),
-            )
         dr = DocumentRetriever(
             embedder,
             chunk_size=int(chunk_config["size"]),
@@ -819,33 +1028,38 @@ class MultiviewIndex:
         dr.chunk_source = payload["doc_source"]
         dr.chunk_type = payload["doc_type"]
         dr.chunk_schema_map = payload["doc_schema_map"]
-        doc_faiss_path = save_path + ".doc.faiss"
-        if os.path.exists(doc_faiss_path):
-            dr._index = faiss.read_index(doc_faiss_path)
+        dr._index = faiss_indices["doc"]
         instance.doc_retriever = dr
 
         # Restore SchemaIndex (View 3)
         si = SchemaIndex(embedder, reranker=reranker)
         si.entries = payload["schema_entries"]
-        schema_faiss_path = save_path + ".schema.faiss"
-        if os.path.exists(schema_faiss_path):
-            si._index = faiss.read_index(schema_faiss_path)
+        si._index = faiss_indices["schema"]
         instance.schema_index = si
 
         # Restore CellIndex (View 4)
-        ci = CellIndex(embedder, reranker=reranker)
+        cell_config = payload["index_build_config"]["cell_index"]
+        ci = CellIndex(
+            embedder,
+            budget=cell_config["budget"],
+            per_table_quota=cell_config["per_table_quota"],
+            reranker=reranker,
+        )
         ci.entries = payload["cell_entries"]
-        cell_faiss_path = save_path + ".cell.faiss"
-        if os.path.exists(cell_faiss_path):
-            ci._index = faiss.read_index(cell_faiss_path)
+        ci._index = faiss_indices["cell"]
         instance.cell_index = ci
 
-        # Restore RowIndex (View 4 (row component), Phase F-A; backward-compatible if absent)
-        ri = RowIndex(embedder, reranker=reranker)
-        ri.entries = payload.get("row_entries", [])
-        row_faiss_path = save_path + ".row.faiss"
-        if os.path.exists(row_faiss_path):
-            ri._index = faiss.read_index(row_faiss_path)
+        # Restore RowIndex (View 4 row component).
+        row_config = payload["index_build_config"]["row_index"]
+        ri = RowIndex(
+            embedder,
+            budget=row_config["budget"],
+            per_table_quota=row_config["per_table_quota"],
+            max_row_chars=row_config["max_row_chars"],
+            reranker=reranker,
+        )
+        ri.entries = payload["row_entries"]
+        ri._index = faiss_indices["row"]
         instance.row_index = ri
 
         logger.info(
