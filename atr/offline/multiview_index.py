@@ -5,7 +5,8 @@ import os
 import json
 import pickle
 import logging
-from collections import Counter
+import threading
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 import faiss
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 DOCUMENT_CHUNK_SIZE = 512
 DOCUMENT_CHUNK_OVERLAP = 64
 DOCUMENT_CHUNK_UNIT = "tokens"
-INDEX_FORMAT_VERSION = 2
+INDEX_FORMAT_VERSION = 3
 
 
 class IncompatibleIndexError(RuntimeError):
@@ -141,15 +142,27 @@ def _validate_index_payload(save_path: str, payload: Dict[str, Any]) -> None:
     row_max_chars = (
         row_config.get("max_row_chars") if isinstance(row_config, dict) else None
     )
+    if isinstance(row_config, dict):
+        for key in ("budget", "per_table_quota", "max_row_chars"):
+            if key not in row_config:
+                violations.append(f"index_build_config.row_index.{key} is required")
     for name, value in (
         ("cell_index.budget", cell_budget),
         ("cell_index.per_table_quota", cell_quota),
+    ):
+        if not isinstance(value, int) or value <= 0:
+            violations.append(f"index_build_config.{name} must be a positive integer")
+    for name, value in (
         ("row_index.budget", row_budget),
         ("row_index.per_table_quota", row_quota),
         ("row_index.max_row_chars", row_max_chars),
     ):
-        if not isinstance(value, int) or value <= 0:
-            violations.append(f"index_build_config.{name} must be a positive integer")
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        ):
+            violations.append(
+                f"index_build_config.{name} must be null or a positive integer"
+            )
     if not isinstance(build_config.get("embedding_model"), str) or not build_config.get(
         "embedding_model"
     ):
@@ -471,11 +484,20 @@ class RowIndex:
     def __init__(
         self,
         embedder: Embedder,
-        budget: int = 500_000,
-        per_table_quota: int = 100,
-        max_row_chars: int = 600,
+        budget: Optional[int] = None,
+        per_table_quota: Optional[int] = None,
+        max_row_chars: Optional[int] = None,
         reranker: Optional[CrossEncoderCandidateReranker] = None,
     ) -> None:
+        for name, value in (
+            ("budget", budget),
+            ("per_table_quota", per_table_quota),
+            ("max_row_chars", max_row_chars),
+        ):
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            ):
+                raise ValueError(f"{name} must be None or a positive integer")
         self.embedder = embedder
         self.reranker = reranker
         self.budget = budget
@@ -484,11 +506,21 @@ class RowIndex:
         # [{table_id, row_idx, row_text, row_dict}]
         self.entries: List[Dict[str, Any]] = []
         self._index: Optional[faiss.IndexFlatIP] = None
+        self._table_entry_ids: Dict[str, List[int]] = defaultdict(list)
+        self._table_entry_ids_count = 0
+        self._cached_table_id: Optional[str] = None
+        self._cached_table_index: Optional[faiss.IndexFlatIP] = None
+        self._cached_table_global_ids: Optional[np.ndarray] = None
+        self._table_search_lock = threading.Lock()
 
     def add_table(self, table_id: str, df: pd.DataFrame) -> None:
-        """Encode each row up to `per_table_quota`, respecting the global budget."""
-        remaining_global = max(0, self.budget - len(self.entries))
-        take = min(self.per_table_quota, remaining_global, len(df))
+        """Queue table rows for encoding; defaults include every source row."""
+        remaining_global = (
+            max(0, self.budget - len(self.entries))
+            if self.budget is not None else len(df)
+        )
+        table_limit = self.per_table_quota or len(df)
+        take = min(table_limit, remaining_global, len(df))
         if take == 0:
             return
 
@@ -497,9 +529,10 @@ class RowIndex:
             parts = [f"{col}: {row[col]}" for col in df.columns
                      if pd.notna(row[col]) and str(row[col]).strip()]
             row_text = f"Table {table_id} | " + " | ".join(parts)
-            if len(row_text) > self.max_row_chars:
+            if self.max_row_chars is not None and len(row_text) > self.max_row_chars:
                 row_text = row_text[: self.max_row_chars - 1] + "…"
 
+            entry_id = len(self.entries)
             self.entries.append({
                 "table_id": table_id,
                 "row_idx": int(row_idx),
@@ -507,6 +540,9 @@ class RowIndex:
                 "row_dict": {c: (str(row[c]) if pd.notna(row[c]) else "")
                              for c in df.columns},
             })
+            self._table_entry_ids[table_id].append(entry_id)
+        self._table_entry_ids_count = len(self.entries)
+        self._clear_table_search_cache()
 
     def build(self) -> None:
         if not self.entries:
@@ -516,6 +552,7 @@ class RowIndex:
         dim = embeddings.shape[1]
         self._index = faiss.IndexFlatIP(dim)
         self._index.add(embeddings.astype(np.float32))
+        self._clear_table_search_cache()
         logger.info(f"RowIndex built: {len(self.entries)} rows.")
 
     def retrieve(
@@ -526,35 +563,90 @@ class RowIndex:
     ) -> List[Dict[str, Any]]:
         """
         Return top-K rows ranked by similarity to the query.
-        If `table_id` is given, restrict to that table only (post-filter).
+        If `table_id` is given, FAISS searches only that table's row IDs.
         """
-        if self._index is None or len(self.entries) == 0:
+        if self._index is None or len(self.entries) == 0 or top_k <= 0:
             return []
+        if self._table_entry_ids_count != len(self.entries):
+            self._rebuild_table_entry_ids()
+
+        allowed_ids: Optional[np.ndarray] = None
+        population = len(self.entries)
+        if table_id is not None:
+            allowed_ids = np.asarray(
+                self._table_entry_ids.get(table_id, []), dtype=np.int64
+            )
+            population = len(allowed_ids)
+            if population == 0:
+                return []
+
         q_emb = self.embedder.encode([query]).astype(np.float32)
         candidate_k = (
-            self.reranker.recall_size(top_k, len(self.entries))
-            if self.reranker else min(top_k, len(self.entries))
+            self.reranker.recall_size(top_k, population)
+            if self.reranker else min(top_k, population)
         )
-        # Over-fetch when filtering by table_id so enough in-table candidates
-        # remain for the cross-encoder.
-        search_k = min(len(self.entries), candidate_k * (10 if table_id else 1))
-        _, I = self._index.search(q_emb, search_k)
+        if allowed_ids is None:
+            _, indices = self._index.search(q_emb, candidate_k)
+        else:
+            indices = self._search_table(q_emb, candidate_k, table_id, allowed_ids)
 
         candidates = []
-        for i in I[0]:
+        for i in indices[0]:
             if i < 0 or i >= len(self.entries):
                 continue
-            e = self.entries[i]
-            if table_id is not None and e["table_id"] != table_id:
-                continue
-            candidates.append(e)
-            if len(candidates) >= candidate_k:
-                break
+            candidates.append(self.entries[i])
         if not self.reranker:
             return candidates[:top_k]
         return self.reranker.select(
             query, candidates, [e["row_text"] for e in candidates], top_k
         )
+
+    def _rebuild_table_entry_ids(self) -> None:
+        self._table_entry_ids = defaultdict(list)
+        for entry_id, entry in enumerate(self.entries):
+            self._table_entry_ids[entry["table_id"]].append(entry_id)
+        self._table_entry_ids_count = len(self.entries)
+        self._clear_table_search_cache()
+
+    def _search_table(
+        self,
+        query_embedding: np.ndarray,
+        top_k: int,
+        table_id: str,
+        global_ids: np.ndarray,
+    ) -> np.ndarray:
+        """Run exact FAISS search over one table and map local IDs to globals."""
+        with self._table_search_lock:
+            if self._cached_table_id != table_id:
+                start = int(global_ids[0])
+                contiguous = np.array_equal(
+                    global_ids,
+                    np.arange(start, start + len(global_ids), dtype=np.int64),
+                )
+                if contiguous:
+                    vectors = self._index.reconstruct_n(start, len(global_ids))
+                else:
+                    vectors = np.vstack(
+                        [
+                            self._index.reconstruct(int(entry_id))
+                            for entry_id in global_ids
+                        ]
+                    )
+                table_index = faiss.IndexFlatIP(self._index.d)
+                table_index.add(np.ascontiguousarray(vectors, dtype=np.float32))
+                self._cached_table_id = table_id
+                self._cached_table_index = table_index
+                self._cached_table_global_ids = global_ids.copy()
+
+            _, local_ids = self._cached_table_index.search(query_embedding, top_k)
+            valid = local_ids[0][local_ids[0] >= 0]
+            mapped = self._cached_table_global_ids[valid]
+            return mapped.reshape(1, -1)
+
+    def _clear_table_search_cache(self) -> None:
+        self._cached_table_id = None
+        self._cached_table_index = None
+        self._cached_table_global_ids = None
 
     def _embed_in_batches(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
         vecs = []
@@ -736,6 +828,9 @@ class MultiviewIndex:
         rerank_candidate_multiplier: int = 6,
         document_chunk_size: int = DOCUMENT_CHUNK_SIZE,
         document_chunk_overlap: int = DOCUMENT_CHUNK_OVERLAP,
+        row_budget: Optional[int] = None,
+        row_per_table_quota: Optional[int] = None,
+        max_row_chars: Optional[int] = None,
     ) -> None:
         self.excel_dir = excel_dir
         self.doc_dir = doc_dir
@@ -770,8 +865,9 @@ class MultiviewIndex:
         # Phase F-A: View 4 (row component), Row Index (per-row embeddings for RETRIEVE)
         self.row_index = RowIndex(
             self.embedder,
-            budget=max(budget, 500_000),
-            per_table_quota=max(per_table_quota, 100),
+            budget=row_budget,
+            per_table_quota=row_per_table_quota,
+            max_row_chars=max_row_chars,
             reranker=self.reranker,
         )
 
@@ -1060,6 +1156,7 @@ class MultiviewIndex:
         )
         ri.entries = payload["row_entries"]
         ri._index = faiss_indices["row"]
+        ri._rebuild_table_entry_ids()
         instance.row_index = ri
 
         logger.info(

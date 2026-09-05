@@ -165,7 +165,8 @@ The loader validates the saved format version, build settings, metadata counts,
 and every FAISS component before loading model weights. Legacy or partially
 rebuilt indices fail closed with a rebuild instruction; they are never silently
 treated as current indices. A current-format index does not need rebuilding for
-reranking alone.
+reranking alone. Index format v3 removes the former row caps, so indices built
+with v2 or earlier must be rebuilt once before inference.
 
 ### 2. Run online inference (Algorithm 1)
 
@@ -190,6 +191,9 @@ Useful flags:
   sub-queries within one question remain sequential.
 - RETRIEVE performs one row search with the current sub-query and returns
   `ROW_TOP_K=10` rows; it does not issue extra entity-keyed row searches.
+  Row indexing covers every source row by default, and a known table ID is
+  enforced inside the FAISS search so global high-scoring rows cannot crowd
+  the target table out of its top-10 result set.
 - Non-reasoning backbones use temperature `0`. APIs that reject temperature
   (for example, reasoning-enabled models) receive only their supported controls.
 - `--decomposer_backbone <key>`: drive only the decomposer with another backbone (rest stays on `--backbone`); decomposer-model robustness in Table 4.

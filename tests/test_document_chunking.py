@@ -49,9 +49,9 @@ def _current_payload(**overrides):
             "embedding_model": "bge-m3",
             "cell_index": {"budget": 10_000, "per_table_quota": 50},
             "row_index": {
-                "budget": 500_000,
-                "per_table_quota": 100,
-                "max_row_chars": 600,
+                "budget": None,
+                "per_table_quota": None,
+                "max_row_chars": None,
             },
         },
         "schema_entries": [],
@@ -110,9 +110,9 @@ class DocumentChunkingTest(unittest.TestCase):
             index.row_index = SimpleNamespace(
                 entries=[],
                 _index=None,
-                budget=500_000,
-                per_table_quota=100,
-                max_row_chars=600,
+                budget=None,
+                per_table_quota=None,
+                max_row_chars=None,
             )
             index.table_schemas = {}
             index.bge_model_path = "BAAI/bge-m3"
@@ -131,7 +131,7 @@ class DocumentChunkingTest(unittest.TestCase):
             )
             self.assertEqual(
                 payload["index_build_config"]["row_index"]["per_table_quota"],
-                100,
+                None,
             )
 
     def test_rejects_legacy_metadata_instead_of_relabelling_it(self):
@@ -146,6 +146,11 @@ class DocumentChunkingTest(unittest.TestCase):
         }
         with self.assertRaisesRegex(IncompatibleIndexError, "Rebuild every component"):
             _validate_index_payload("legacy", legacy_payload)
+
+    def test_rejects_previous_row_index_contract(self):
+        payload = _current_payload(index_format_version=2)
+        with self.assertRaisesRegex(IncompatibleIndexError, "expected 3"):
+            _validate_index_payload("capped-row-index", payload)
 
     def test_rejects_table_index_without_rows(self):
         payload = _current_payload(
@@ -193,9 +198,9 @@ class DocumentChunkingTest(unittest.TestCase):
             index.row_index = SimpleNamespace(
                 entries=[],
                 _index=None,
-                budget=500_000,
-                per_table_quota=100,
-                max_row_chars=600,
+                budget=None,
+                per_table_quota=None,
+                max_row_chars=None,
             )
             index.table_schemas = {}
             index.save()
@@ -213,7 +218,7 @@ class DocumentChunkingTest(unittest.TestCase):
 
             self.assertEqual(loaded.bge_model_path, "BAAI/bge-m3")
             self.assertEqual(loaded.cell_index.budget, 10_000)
-            self.assertEqual(loaded.row_index.per_table_quota, 100)
+            self.assertIsNone(loaded.row_index.per_table_quota)
 
     def test_cell_index_default_budget_matches_paper(self):
         self.assertEqual(

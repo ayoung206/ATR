@@ -16,8 +16,8 @@ Usage:
     --excel_dir ./dataset/HybridQA/dev_excel \\
     --bge_dir <BGE_DIR> \\
     --save_path index/hybridqa_multiview_v6 \\
-    --per_table_quota 100 \\
-    --budget 500000 \\
+    --per_table_quota 0 \\
+    --budget 0 \\
     --device cuda
 """
 from __future__ import annotations
@@ -44,10 +44,17 @@ def main():
                     help="Path to bge-m3 model dir.")
     ap.add_argument("--save_path", required=True,
                     help="Destination prefix for new index (with V6 RowIndex).")
-    ap.add_argument("--budget", type=int, default=500_000)
-    ap.add_argument("--per_table_quota", type=int, default=100)
+    ap.add_argument("--budget", type=int, default=0,
+                    help="Global row cap; 0 indexes every row.")
+    ap.add_argument("--per_table_quota", type=int, default=0,
+                    help="Per-table row cap; 0 indexes every row.")
+    ap.add_argument("--max_row_chars", type=int, default=0,
+                    help="Serialized row character cap; 0 keeps full rows.")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
+    for name in ("budget", "per_table_quota", "max_row_chars"):
+        if getattr(args, name) < 0:
+            ap.error(f"--{name} must be 0 or a positive integer")
 
     # 1. Copy existing .doc/.schema/.cell faiss + meta to new save_path
     print(f"[1/4] Copying existing index → {args.save_path}.*")
@@ -77,8 +84,9 @@ def main():
     print("[3/4] Scanning excel_dir for row-level extraction...")
     idx.row_index = RowIndex(
         idx.embedder,
-        budget=args.budget,
-        per_table_quota=args.per_table_quota,
+        budget=args.budget or None,
+        per_table_quota=args.per_table_quota or None,
+        max_row_chars=args.max_row_chars or None,
     )
     n_tables = 0
     t0 = time.time()

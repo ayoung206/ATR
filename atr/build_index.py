@@ -49,6 +49,24 @@ def main() -> None:
                              "contributes equally (fixes 6.1%% global-cap "
                              "coverage problem).")
     parser.add_argument(
+        "--row_budget",
+        type=int,
+        default=0,
+        help="Row Index global cap; 0 indexes every row (paper default)",
+    )
+    parser.add_argument(
+        "--row_per_table_quota",
+        type=int,
+        default=0,
+        help="Row Index per-table cap; 0 indexes every row (paper default)",
+    )
+    parser.add_argument(
+        "--max_row_chars",
+        type=int,
+        default=0,
+        help="Maximum serialized row characters; 0 keeps full rows (paper default)",
+    )
+    parser.add_argument(
         "--document_chunk_size",
         type=int,
         default=DOCUMENT_CHUNK_SIZE,
@@ -64,6 +82,9 @@ def main() -> None:
                         help="Device for embedding: auto|cpu|cuda|cuda:0")
     parser.add_argument("--require_cuda", action="store_true")
     args = parser.parse_args()
+    for name in ("row_budget", "row_per_table_quota", "max_row_chars"):
+        if getattr(args, name) < 0:
+            parser.error(f"--{name} must be 0 or a positive integer")
 
     init_logger(name="build_index", level=logging.INFO, log_file=None)
     logger = logging.getLogger("build_index")
@@ -73,6 +94,8 @@ def main() -> None:
     logger.info(
         f"BGE model: {bge_model_path}, budget={args.budget}, "
         f"per_table_quota={args.per_table_quota}, device={args.device}, "
+        f"row_budget={args.row_budget or 'all'}, "
+        f"row_per_table_quota={args.row_per_table_quota or 'all'}, "
         f"document_chunks={args.document_chunk_size}/"
         f"{args.document_chunk_overlap} tokens"
     )
@@ -89,6 +112,9 @@ def main() -> None:
         require_cuda=args.require_cuda,
         document_chunk_size=args.document_chunk_size,
         document_chunk_overlap=args.document_chunk_overlap,
+        row_budget=args.row_budget or None,
+        row_per_table_quota=args.row_per_table_quota or None,
+        max_row_chars=args.max_row_chars or None,
     )
     index.build()
     index.save()
