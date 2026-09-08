@@ -1,0 +1,402 @@
+"""Retrieval-guided SQL with fail-closed structural constraint validation."""
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+from atr.online.value_linker import LinkedValue, build_value_bindings_text
+from atr.prompt import CONSTRAINED_SQL_QUERY_TEMPLATE
+
+def _infer_answer_type(sub_query: str) -> str:
+    """Heuristic: infer what type of value the query expects in SELECT."""
+    q = sub_query.lower().strip()
+    if q.startswith(("who ", "which person", "who is", "who was", "whose")):
+        return "person name"
+    if q.startswith(("what country", "which country", "what nation")):
+        return "country name"
+    if q.startswith(("what city", "which city", "what town", "where is", "where was", "where are")):
+        return "city or location name"
+    if q.startswith(("when ", "what year", "what date", "in what year", "what month")):
+        return "date or year"
+    if any(q.startswith(p) for p in ("how many", "how much", "what is the number", "count")):
+        return "integer count or quantity"
+    if "age" in q or "how old" in q or "born" in q:
+        return "age or year (integer)"
+    if "difference" in q or "how long" in q or "how far" in q:
+        return "numeric difference"
+    if q.startswith(("what is the name", "what was the name", "what is the title")):
+        return "name or title string"
+    return "(infer from query context)"
+
+logger = logging.getLogger(__name__)
+
+from atr.clients.sql_tool import get_excel_rag_response_plain  # noqa: E402
+
+def _execution_confidence(sql_result: str) -> float:
+    """
+    c^exec = 1[parse] · 1[non-empty] · stability(o_t)
+    Simplified: penalise failed / empty results.
+    """
+    if not sql_result or not sql_result.strip():
+        return 0.0
+    lower = sql_result.lower()
+    if "error" in lower or "failed" in lower or "exception" in lower:
+        return 0.0
+    if "empty" in lower or "no result" in lower or sql_result.strip() in ("[]", "{}"):
+        return 0.3
+    return 1.0
+
+def _normalise_identifier(value: Any) -> str:
+    text = str(value or "").strip().strip("`\"'").lower()
+    text = re.sub(r"\.(xlsx|xls|csv)$", "", text)
+    return re.sub(r"[\s\-]+", "_", text)
+
+
+def _schema_columns(schema: Optional[Dict[str, Any]]) -> List[str]:
+    columns: List[str] = []
+    for entry in (schema or {}).get("columns", []) or []:
+        if isinstance(entry, dict):
+            name = entry.get("col_name") or entry.get("name")
+        elif isinstance(entry, (list, tuple)) and entry:
+            name = entry[0]
+        else:
+            name = entry
+        if name:
+            columns.append(str(name))
+    return columns
+
+
+def _clean_sql(sql: str) -> str:
+    text = str(sql or "").strip()
+    text = re.sub(r"^```(?:sql)?\s*", "", text, flags=re.IGNORECASE)
+    return re.sub(r"\s*```$", "", text).strip()
+
+
+def validate_sql_constraints(
+    sql: str,
+    allowed_columns: List[str],
+    allowed_tables: List[str],
+    linked_values: List[LinkedValue],
+) -> List[str]:
+    """Return violations of ``C``/``V*``; empty means admissible SQL."""
+    sql = _clean_sql(sql)
+    if not sql:
+        return ["SQL service did not return sql_str"]
+    try:
+        import sqlglot
+        from sqlglot import exp
+        from sqlglot.optimizer.qualify import qualify
+        from sqlglot.optimizer.scope import Scope, traverse_scope
+    except ImportError:
+        return ["sqlglot is required for strict SQL constraint validation"]
+
+    try:
+        statements = [s for s in sqlglot.parse(sql, read="mysql") if s is not None]
+    except Exception as exc:
+        return [f"SQL parse failed: {exc}"]
+    if len(statements) != 1:
+        return ["exactly one SQL statement is required"]
+    tree = statements[0]
+    if not isinstance(tree, exp.Query) or tree.find(exp.Into):
+        return ["only one read-only SELECT query is allowed"]
+
+    violations: List[str] = []
+    allowed_column_set = {_normalise_identifier(c) for c in allowed_columns}
+    allowed_table_set = {_normalise_identifier(t) for t in allowed_tables if t}
+    # Resolve actual sources per scope. A CTE alias in one scope must never
+    # hide a physical table with the same name in another scope.
+    try:
+        physical_tables = [
+            source
+            for scope in traverse_scope(tree)
+            for _, source in scope.selected_sources.values()
+            if isinstance(source, exp.Table)
+        ]
+    except Exception as exc:
+        return [f"SQL source resolution failed: {exc}"]
+    used_tables = {_normalise_identifier(table.name) for table in physical_tables}
+    if any(table.db or table.catalog for table in physical_tables):
+        violations.append("database-qualified tables cannot be verified against C")
+    disallowed_tables = sorted(used_tables - allowed_table_set)
+    if disallowed_tables:
+        violations.append(f"disallowed tables: {', '.join(disallowed_tables)}")
+    if not (used_tables & allowed_table_set):
+        violations.append("query does not reference an allowed table")
+
+    used_columns = {
+        _normalise_identifier(column.name)
+        for column in tree.find_all(exp.Column)
+        if column.name != "*"
+    }
+    stars = list(tree.find_all(exp.Star))
+    if any(star.find_ancestor(exp.Count) is None for star in stars):
+        violations.append("SELECT * is not allowed")
+    if not (used_columns & allowed_column_set) and not stars:
+        violations.append("query does not reference an allowed column")
+
+    # Qualify a validation-only copy with the closed retrieved schema. Do not
+    # expand aliases: SELECT Club AS Secret, Secret must not rewrite a real
+    # forbidden column into Club. ORDER BY output aliases remain supported.
+    try:
+        checked = tree.copy()
+        for identifier in checked.find_all(exp.Identifier):
+            identifier.set("this", identifier.this.lower())
+        schema = {
+            table.name.lower(): {str(c).lower(): "UNKNOWN" for c in allowed_columns}
+            for table in physical_tables
+        }
+        tree = qualify(
+            checked, dialect="mysql", schema=schema, infer_schema=False,
+            expand_alias_refs=False, expand_stars=False,
+        )
+        scopes = list(traverse_scope(tree))
+        outer_scope = scopes[-1] if scopes else None
+    except Exception as exc:
+        violations.append(f"column/source constraint resolution failed: {exc}")
+        return violations
+
+    def _base_column(node: Any, scope: Any) -> Optional[str]:
+        """Prove that a binding refers to a real column, not a computed alias.
+
+        Derived sources are supported only for single-source row-preserving
+        projections. Aggregates, unions, windows and other transformations
+        fail closed; repair can express the binding on the base table instead.
+        """
+        if not isinstance(node, exp.Column) or scope is None:
+            return None
+        source = scope.sources.get(node.table)
+        if isinstance(source, exp.Table):
+            return _normalise_identifier(node.name)
+        if not isinstance(source, Scope) or not isinstance(source.expression, exp.Select):
+            return None
+        select = source.expression
+        if len(source.selected_sources) != 1 or any(
+            select.args.get(key)
+            for key in ("joins", "group", "having", "qualify", "distinct", "limit", "offset")
+        ) or select.find(exp.AggFunc, exp.Window):
+            return None
+        outputs = [s for s in select.expressions if s.alias_or_name == node.name]
+        if len(outputs) != 1:
+            return None
+        projection = outputs[0]
+        if isinstance(projection, exp.Alias):
+            projection = projection.this
+        return _base_column(projection, source)
+
+    # A grounded value is a hard row constraint, not merely a token that may
+    # appear somewhere in the AST. Only a direct predicate in the outer WHERE
+    # can satisfy V*: exact bindings require `column = literal`, fuzzy bindings
+    # require `column LIKE literal`, and the predicate must stay on an AND-only
+    # path to WHERE so OR/NOT/CASE cannot make it optional.
+    outer_where = tree.args.get("where") if isinstance(tree, exp.Select) else None
+
+    def _literal_value(node: Any) -> Optional[str]:
+        if isinstance(node, exp.Literal):
+            return str(node.this)
+        if isinstance(node, exp.Neg) and isinstance(node.this, exp.Literal):
+            return f"-{node.this.this}"
+        return None
+
+    def _mandatory_in_outer_where(predicate: Any) -> bool:
+        if outer_where is None:
+            return False
+        node = predicate.parent
+        while node is not None and node is not outer_where:
+            if not isinstance(node, (exp.And, exp.Paren)):
+                return False
+            node = node.parent
+        return node is outer_where
+
+    def _matches_exact(predicate: Any, column: str, value: str) -> bool:
+        if not isinstance(predicate, exp.EQ) or not _mandatory_in_outer_where(predicate):
+            return False
+        left_column = _base_column(predicate.this, outer_scope)
+        right_column = _base_column(predicate.expression, outer_scope)
+        left_value = _literal_value(predicate.this)
+        right_value = _literal_value(predicate.expression)
+        return (
+            left_column == column and right_value == value
+        ) or (
+            right_column == column and left_value == value
+        )
+
+    def _matches_fuzzy(predicate: Any, column: str, pattern: str) -> bool:
+        return (
+            isinstance(predicate, exp.Like)
+            and _mandatory_in_outer_where(predicate)
+            and isinstance(predicate.this, exp.Column)
+            and _base_column(predicate.this, outer_scope) == column
+            and _literal_value(predicate.expression) == pattern
+        )
+
+    predicates = list(outer_where.find_all(exp.Predicate)) if outer_where else []
+    for linked in linked_values:
+        if not linked.is_matched or linked.matched_value is None:
+            continue
+        wanted_column = _normalise_identifier(linked.column)
+        wanted_value = str(linked.matched_value)
+        expected_fuzzy_pattern = f"%{wanted_value}%"
+        if linked.fallback_level == 2:
+            binding_found = any(
+                _matches_fuzzy(predicate, wanted_column, expected_fuzzy_pattern)
+                for predicate in predicates
+            )
+        else:
+            binding_found = any(
+                _matches_exact(predicate, wanted_column, wanted_value)
+                for predicate in predicates
+            )
+        if not binding_found:
+            if linked.fallback_level == 2:
+                violations.append(
+                    "missing fuzzy LIKE binding: "
+                    f"{linked.column} LIKE {expected_fuzzy_pattern!r} "
+                    "as a mandatory outer WHERE predicate"
+                )
+            else:
+                violations.append(
+                    f"missing exact WHERE binding: {linked.column}={wanted_value!r} "
+                    "as a mandatory equality predicate"
+                )
+    return violations
+
+class ConstrainedSQLExecutor:
+    """
+    §3.5  Retrieval-Guided Constrained SQL Executor.
+
+    Wraps the Flask SQL service (get_excel_rag_response_plain) with:
+      - Column constraint injection and AST enforcement        (Principle 1)
+      - Value binding injection and WHERE enforcement           (Principle 2)
+      - Table context from restored schema                     (Principle 3)
+      - Fail-closed repair on invalid SQL or empty execution    (Principle 4)
+    """
+
+    def __init__(
+        self,
+        table_name_list: List[str],
+        max_retries: int = 2,
+    ) -> None:
+        self.table_name_list = table_name_list
+        self.max_retries = max_retries
+
+    def execute(
+        self,
+        sub_query: str,
+        schema: Optional[Dict[str, Any]],
+        allowed_columns: List[Dict[str, Any]],
+        linked_values: List[LinkedValue],
+        retrieval_evidence: str = "",
+    ) -> Tuple[str, float]:
+        """
+        Generate and execute constrained SQL.
+
+        Args:
+            sub_query:          natural-language sub-query
+            schema:             restored table schema from View 2, used to inject
+                                table name context into the query
+            allowed_columns:    column entries from Schema Index (View 3)
+            linked_values:      grounded value bindings V* from Constrained Value Linking
+            retrieval_evidence: schema/cell evidence text supplied to SQL generation
+
+        Returns:
+            (sql_execution_result, execution_confidence)
+        """
+        col_names = [str(c["col_name"]) for c in allowed_columns if c.get("col_name")]
+        if not col_names:
+            col_names = _schema_columns(schema)
+        col_names = list(dict.fromkeys(col_names))
+        if not col_names:
+            logger.warning("ConstrainedSQL: refusing execution without column constraint C")
+            return "not found", 0.0
+
+        allowed_tables = [
+            str(c.get("table_id") or c.get("table_name") or c.get("source"))
+            for c in allowed_columns
+            if c.get("table_id") or c.get("table_name") or c.get("source")
+        ]
+        if schema and schema.get("table_name"):
+            allowed_tables.append(str(schema["table_name"]))
+        if not allowed_tables:
+            allowed_tables = list(self.table_name_list)
+        allowed_tables = list(dict.fromkeys(allowed_tables))
+        if not allowed_tables:
+            logger.warning("ConstrainedSQL: refusing execution without a table constraint")
+            return "not found", 0.0
+
+        value_bindings_text = build_value_bindings_text(linked_values)
+
+        # Principle 3: inject table name from restored schema (View 2)
+        table_context = ""
+        if schema and schema.get("table_name"):
+            table_context = f"\nTarget table: {schema['table_name']}"
+
+        answer_type_hint = _infer_answer_type(sub_query)
+
+        def _build_query(repair: str = "") -> str:
+            evidence_snippet = retrieval_evidence[:800] if retrieval_evidence else "(none)"
+            base = CONSTRAINED_SQL_QUERY_TEMPLATE.format(
+                original_query=sub_query,
+                allowed_columns=", ".join(col_names) if col_names else "(all)",
+                value_bindings=value_bindings_text,
+                answer_type_hint=answer_type_hint,
+                text_evidence=evidence_snippet,
+            )
+            return base + table_context + repair
+
+        enriched_query = _build_query()
+        sql_result = ""
+
+        for attempt in range(1, self.max_retries + 1):
+            response = get_excel_rag_response_plain(
+                table_name_list=self.table_name_list,
+                query=enriched_query,
+            )
+            sql_result = str(response.get("sql_execution_result", ""))
+            sql_str = str(response.get("sql_str", ""))
+            violations = validate_sql_constraints(
+                sql_str,
+                allowed_columns=col_names,
+                allowed_tables=allowed_tables,
+                linked_values=linked_values,
+            )
+            if violations:
+                logger.warning(
+                    "ConstrainedSQL rejected generated SQL: %s",
+                    "; ".join(violations),
+                )
+                if attempt < self.max_retries:
+                    enriched_query = _build_query(
+                        "\n\nSTRICT CONSTRAINT REPAIR REQUIRED\n"
+                        f"Rejected SQL: {_clean_sql(sql_str)}\n"
+                        f"Violations: {'; '.join(violations)}\n"
+                        "Generate a new SQL query without relaxing C or V*."
+                    )
+                continue
+            c_exec = _execution_confidence(sql_result)
+
+            logger.debug(
+                f"ConstrainedSQL attempt {attempt}: "
+                f"c_exec={c_exec:.2f}, result={str(sql_result)[:120]}"
+            )
+
+            if c_exec != 1.0:
+                if attempt < self.max_retries:
+                    logger.info(
+                        f"ConstrainedSQL: empty/failed result, retrying without "
+                        f"relaxing constraints (attempt {attempt}/{self.max_retries})"
+                    )
+                    enriched_query = _build_query(
+                        "\n\nExecution was empty or failed. Generate a different "
+                        "query that still satisfies every constraint above."
+                    )
+                continue
+
+            return sql_result, c_exec
+
+        # When all retries exhaust without c_exec=1.0, signal
+        # "not found" explicitly rather than returning an empty/last
+        # sql_result string. The verifier's evidence-fusion path will
+        # then treat this as a definitive negative result instead of
+        # asking the LLM to infer from absence.
+        return "not found", 0.0

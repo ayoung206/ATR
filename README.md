@@ -1,0 +1,392 @@
+# Every Answer Has Its Own Path: Agentic Routing for Retrieval-Augmented Table Question Answering
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
+Repository for the EMNLP 2026 paper _"Every Answer Has Its Own Path: Agentic Routing for Retrieval-Augmented Table Question Answering"_.
+
+![ATR architecture](./figures/architecture.png)
+
+## Introduction
+
+- We identify two failure modes of existing agentic table-text QA systems: they commit to a single execution strategy at the question level, and they suffer a **soft-retrieval / hard-execution gap**, where embedding retrieval ranks the correct cell as a candidate yet SQL execution still misses the row because the question's surface form never matches the stored value.
+- We propose **ATR (AgenticTableRAG)**, which decomposes a question into sub-queries and routes each one to `TEXT` / `RETRIEVE` / `SQL` / `HYBRID` over a shared 5-view index. A **HybridValueLinker** grounds entity mentions to values that exist in the cell index before any SQL is issued, and a verifier rejects weak sub-answers and re-invokes the router with the failed-route history.
+- The routing policy is distilled into a **DistilBERT student** that recovers 98.6% of the LLM teacher's decisions at zero per-sub-query LLM cost. A single configuration leads on token F1 across HybridQA, TAT-QA, and WTQ, and transfers unchanged to MultiHiertt and SPARTA, which the router never saw.
+
+## Setup
+
+### Environment
+
+```bash
+git clone https://github.com/ayoung206/ATR.git && cd ATR
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+python -m atr.smoke               # 5-check install verification (~10 s)
+```
+
+### External dependencies
+
+1. **Vertex AI service-account JSON** at `./vertexai.json` (or set `VERTEXAI_CREDENTIALS_PATH`).
+2. **BGE-M3 embedder and BGE-reranker-v2-M3 cross-encoder**: download both
+   from HuggingFace and pass their parent directory to `--bge_dir`:
+   ```bash
+   huggingface-cli download BAAI/bge-m3 --local-dir ./models/bge-m3
+   huggingface-cli download BAAI/bge-reranker-v2-m3 --local-dir ./models/bge-reranker-v2-m3
+   ```
+3. **The Flask SQL service** (for the `SQL` / `HYBRID` primitives). ATR does not
+   ship it. Use the implementation released with TableRAG (Yu et al., EMNLP
+   2025) and follow that repository's setup:
+   ```bash
+   git clone https://github.com/yxh-y/TableRAG/ tablerag
+   cd tablerag/offline_data_ingestion_and_query_interface/src
+
+   # MySQL: create a database + user, fill in that project's config, then
+   # ingest your tables (once per benchmark) and start the service:
+   python data_persistent.py --excel_dir $DATA_DIR/hybridqa/dev_excel/
+   python interface.py                            # binds 0.0.0.0:5000
+   ```
+   Then `export SQL_SERVICE_URL=http://127.0.0.1:5000/get_tablerag_response`.
+
+   ATR validates every returned SQL statement with an AST gate before using
+   its result: only one read-only `SELECT` is accepted, referenced tables and
+   columns must belong to the retrieved constraints, and every exact grounded
+   value must be a mandatory `column = value` predicate in the outer `WHERE`.
+   `OR`, `NOT`, another comparison operator, or a nested occurrence cannot
+   satisfy the binding. Invalid SQL is repaired without relaxing `C` or `V*`;
+   exhausted repairs fail closed.
+
+   Columns and tables are resolved within each query scope; an output alias
+   cannot authorize a forbidden physical column. Exact and fuzzy bindings
+   must trace to the original column, including through simple CTE or derived
+   table projections. Constants, computed aliases, and derived sources whose
+   bindings cannot be proved (such as aggregates or unions) are rejected and
+   repaired. Database-qualified tables are rejected because the retrieved
+   constraints do not identify a database namespace. Validation checks the
+   SQL returned by the external service before accepting its result; it does
+   not run inside that service before SQL execution.
+
+   You can run ATR without the SQL service if you only need the `TEXT` / `RETRIEVE` routes (the router will degrade gracefully).
+4. **(Optional) Official TAT-QA evaluator**, needed only for Recipe B's EM/F1 numbers:
+   ```bash
+   git clone https://github.com/NExTplusplus/TAT-QA <somewhere>/TAT-QA
+   export TATQA_DIR=<somewhere>/TAT-QA
+   ```
+   ATR's own relaxed/EM metric in `atr.evaluate` does not need this.
+
+### Router checkpoint
+
+Train the distilled DistilBERT router yourself with `atr.tools.train_router`
+(step 3 under **Usage**, a few minutes on a single GPU), or point
+`ATR_ROUTER_REPO` at any HuggingFace repo you control and fetch it with:
+
+```bash
+python -m atr.tools.download_router --out_dir ./models/atr_router
+```
+
+A hosted checkpoint will be linked here once it is up.
+
+The current router input (v2) includes the full SubQuery metadata, restored
+schema, and cumulative failed-route history. A checkpoint trained with an
+older input format still loads with a warning, but must be retrained with the
+current `distill` and `train` commands for paper-aligned re-routing.
+
+### Credentials safety
+
+`vertexai.json` (GCP service-account) and any local database config are git-ignored. To get a second line of defence that aborts commits containing those files even if `.gitignore` is bypassed, opt in to the bundled pre-commit hook once:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+### Data
+
+This repository ships no benchmark data. Download each dataset from its
+own release and convert it locally:
+
+| Benchmark            | Upstream                                         | License        |
+|----------------------|--------------------------------------------------|----------------|
+| HybridQA             | https://github.com/wenhuchen/HybridQA            | CC BY-SA 4.0   |
+| TAT-QA               | https://github.com/NExTplusplus/TAT-QA           | MIT            |
+| WikiTableQuestions   | https://ppasupat.github.io/WikiTableQuestions/   | CC BY 4.0      |
+
+```bash
+export DATA_DIR=/path/to/your/data          # used by every command below
+
+# TAT-QA and WTQ need converting into the (excel dir, doc dir, flat json) layout
+python scripts/convert_tatqa.py \
+    --src /path/to/tatqa_dataset_dev.json --out_dir $DATA_DIR
+python scripts/convert_wtq.py \
+    --wtq_dir /path/to/WikiTableQuestions --out_dir $DATA_DIR
+```
+
+That writes `$DATA_DIR/tatqa_excel/`, `$DATA_DIR/tatqa_doc/`,
+`$DATA_DIR/tatqa_dev_flat.json`, `$DATA_DIR/wtq_excel/` and
+`$DATA_DIR/wtq_unseen_flat.json`. HybridQA is already in that layout after
+download. When you report numbers on any of these benchmarks, please cite the
+original paper in addition to ATR.
+
+## Repository layout
+
+```
+ATR/
+├── atr/                       # Core package
+│   ├── config.py              # Vertex / OpenAI backbones, default hyperparameters
+│   ├── prompt.py              # All LLM prompts used by ATR
+│   ├── build_index.py         # Offline 5-view index builder (CLI)
+│   ├── evaluate.py            # Rule + LLM-judge evaluator
+│   ├── online/                # Online inference loop (Algorithm 1)
+│   │   ├── main.py            # Entry point: AgenticTableRAGAgent.run_single
+│   │   ├── decomposer.py      # Question → ordered SubQuery list
+│   │   ├── router.py          # Heuristic / LLM / learned / fixed routers
+│   │   ├── value_linker.py    # HybridValueLinker (embedding + LLM verify)
+│   │   ├── constrained_sql.py # (C, V*)-constrained SQL executor
+│   │   └── verifier.py        # EvidenceFusionVerifier + escalation
+│   ├── offline/
+│   │   └── multiview_index.py # 5-view index (Text / Table / Schema / Cell / SQL)
+│   ├── clients/               # LLM client, SQL-service client, BGE-M3 embedder
+│   ├── baselines/             # NaiveLLM / NaiveRAG / NaiveRAG-SC / ReAct
+│   └── tools/
+│       └── train_router.py    # DistilBERT learned-router training pipeline
+├── scripts/                   # Index building, dataset conversion, TAT-QA eval
+├── requirements.txt
+├── .gitignore
+└── .githooks/pre-commit       # Refuses to commit credential files
+```
+
+## Usage
+
+### 1. Build the 5-view index
+
+```bash
+python -m atr.build_index \
+    --excel_dir ./data/excel \
+    --doc_dir   ./data/docs \
+    --bge_dir   ./models \
+    --save_path ./index/hybridqa_multiview \
+    --document_chunk_size 512 \
+    --document_chunk_overlap 64 \
+    --budget    10000
+```
+
+Index construction only needs `<bge_dir>/bge-m3/`. Online retrieval recalls
+six times the requested result count with BGE-M3, then reranks the candidates
+for Views 1--4 with `<bge_dir>/bge-reranker-v2-m3/`. Document chunks use the
+BGE-M3 tokenizer with the paper settings of 512 tokens and 64-token overlap.
+The loader validates the saved format version, build settings, metadata counts,
+and every FAISS component before loading model weights. Legacy or partially
+rebuilt indices fail closed with a rebuild instruction; they are never silently
+treated as current indices. A current-format index does not need rebuilding for
+reranking alone. Index format v3 removes the former row caps, so indices built
+with v2 or earlier must be rebuilt once before inference.
+
+### 2. Run online inference (Algorithm 1)
+
+```bash
+python -m atr.online.main \
+    --backbone        gemini \
+    --data_file_path  ./data/hybridqa_shard50_B.json \
+    --index_path      ./index/hybridqa_multiview \
+    --bge_dir         ./models \
+    --router_type     learned \
+    --router_model_path ./models/atr_router_distilbert \
+    --max_iter 5 --max_workers 2 --device cuda --require_cuda \
+    --final_synthesis
+```
+
+Useful flags:
+- `--router_type {heuristic, llm, learned, fixed}`: pick the routing policy.
+- `--force_route HYBRID` (with `--router_type fixed`): ablate to a single primitive.
+- `--no_decomposition`: run the loop on the raw question (collapse to K_max=1).
+- `--verifier_threshold 0.1`: uncertainty cutoff for the stop controller.
+- `--max_workers 2`: process two independent dataset questions concurrently;
+  sub-queries within one question remain sequential.
+- RETRIEVE performs one row search with the current sub-query and returns
+  `ROW_TOP_K=10` rows; it does not issue extra entity-keyed row searches.
+  Row indexing covers every source row by default, and a known table ID is
+  enforced inside the FAISS search so global high-scoring rows cannot crowd
+  the target table out of its top-10 result set.
+- Failure history records both the router's `requested_route` and the
+  `effective_route` that actually produced the answer. If ValueLinker falls
+  through from RETRIEVE/HYBRID to TEXT, re-routing excludes TEXT while the
+  current sub-query's ValueLinker fallback ladder still advances exactly once.
+- ValueLinker never falls back to TEXT if the question's failure history
+  already records an effective TEXT execution. At the reroute stage it tries
+  the existing fuzzy candidates, or drops the unmatched entity's constraint
+  when no unambiguous fuzzy match exists. This adds no LLM call; other grounded
+  entity bindings remain intact.
+- ValueLinker accepts only a candidate `(column, value)` pair whose column
+  belongs to retrieved `C`. The LLM selects both `matched_value` and
+  `matched_column`; legacy value-only replies require an unambiguous column.
+  Fuzzy fallback preserves the candidate's original column. Invalid selections
+  follow the fallback ladder without introducing ungrounded bindings.
+- Cell retrieval merges and deduplicates the column-conditioned candidate
+  lists, removes columns outside `C`, and ranks the complete merged pool
+  against the entity before selecting top-15. With `--no_reranker`, the final
+  ranking uses a common entity embedding instead of column-list order.
+- Non-reasoning backbones use temperature `0`. APIs that reject temperature
+  (for example, reasoning-enabled models) receive only their supported controls.
+- `--decomposer_backbone <key>`: drive only the decomposer with another backbone (rest stays on `--backbone`); decomposer-model robustness in Table 4.
+- `--verifier_backbone <key>`: drive only the verifier verdict with another backbone; verifier-model robustness in Table 4.
+- `--oracle_verifier`: upper bound, returning any produced candidate matching the gold, measuring the accuracy ceiling a perfect verifier could reach.
+- `--reranker_path <path>`: use a reranker checkpoint outside `<bge_dir>`.
+- `--rerank_candidate_multiplier 6`: dense candidate pool size per final result.
+- `--no_reranker`: disable cross-encoder reranking for an explicit ablation.
+
+### 3. Train the learned router
+
+```bash
+# (a) Teacher labels. Either distil them from an LLM router run directly...
+python -m atr.tools.train_router distill \
+    --data_file $DATA_DIR/hybridqa_shard50_B.json \
+    --excel_dir $DATA_DIR/dev_excel \
+    --backbone  gemini \
+    --out_file  labels/router_labels_hybridqa.jsonl
+
+# ...or recover accepted routes from an LLM-routed inference log generated
+# with --emit_trace (the trace preserves schema + cumulative failure history):
+python -m atr.tools.train_router from_inference \
+    --inference_log output/atr_hybridqa_llm.jsonl \
+    --out_file      labels/router_labels_hybridqa.jsonl
+
+# (b) Fine-tune DistilBERT
+python -m atr.tools.train_router train \
+    --oracle_file labels/router_labels_hybridqa.jsonl \
+    --output_dir  ./models/atr_router_distilbert \
+    --epochs 5
+
+# (c) Evaluate the student against the teacher's labels
+python -m atr.tools.train_router eval \
+    --model_dir   ./models/atr_router_distilbert \
+    --oracle_file labels/router_labels_hybridqa.jsonl
+```
+
+`distill` records the teacher's initial route and its re-selections for up to
+three cumulative failed-route histories, matching the online escalation loop.
+
+### 4. Evaluate inference outputs
+
+```bash
+python -m atr.evaluate \
+    --result_file_path ./outputs/atr_hybridqa.jsonl
+
+# TAT-QA needs multi-span / scale-aware metrics:
+python scripts/eval_tatqa.py --result_file ./outputs/atr_tatqa.jsonl
+```
+
+## Reproducing the paper
+
+> Headline numbers (Full ATR with Gemini 2.5 Flash, K_max = 5, learned router):
+> **HybridQA dev**: EM 40.83, Relaxed 61.59, token F1 54.02, LLM Judge 54.02.
+
+The recipes below assume you have completed **Setup**, started the SQL
+service, and downloaded the BGE-M3 embedder and a router checkpoint. All
+commands are run from the repo root.
+
+### Recipe A. HybridQA dev (Table 1 headline)
+
+```bash
+# 1. Ingest HybridQA tables into MySQL
+# (run inside your TableRAG service checkout)
+python data_persistent.py --excel_dir $DATA_DIR/hybridqa/dev_excel/
+
+# 2. Build the 5-view index (~10 min on a single A6000)
+python -m atr.build_index \
+    --excel_dir $DATA_DIR/hybridqa/dev_excel \
+    --doc_dir   $DATA_DIR/hybridqa/dev_doc \
+    --bge_dir   ./models \
+    --save_path index/hybridqa_multiview --budget 10000
+
+# 3. Run online inference (~30 min, ≈1 LLM call/sub-query)
+python -m atr.online.main \
+    --backbone        gemini \
+    --data_file_path  $DATA_DIR/hybridqa_shard50_B.json \
+    --index_path      index/hybridqa_multiview \
+    --bge_dir         ./models \
+    --router_type     learned \
+    --router_model_path ./models/atr_router \
+    --max_iter 5 --device cuda --require_cuda \
+    --final_synthesis \
+    --save_file_path output/atr_hybridqa.jsonl
+
+# 4. Score
+python -m atr.evaluate --result_file_path output/atr_hybridqa.jsonl
+#    → expect token F1 ≈ 54.02, Relaxed ≈ 61.59 (±1 pp; LLM-judge noise)
+```
+
+### Recipe B. TAT-QA dev (Table 1)
+
+```bash
+# Assumes the SQL service has been re-pointed at a TAT-QA MySQL database.
+# 1. Build index over TAT-QA tables + passages
+python -m atr.build_index \
+    --excel_dir $DATA_DIR/tatqa_excel \
+    --doc_dir   $DATA_DIR/tatqa_doc \
+    --bge_dir   ./models \
+    --save_path index/tatqa_multiview --budget 10000
+
+# 2. Run + evaluate with the TAT-QA-aware multi-span metric
+python -m atr.online.main \
+    --backbone        gemini \
+    --data_file_path  $DATA_DIR/tatqa_dev_flat.json \
+    --index_path      index/tatqa_multiview \
+    --bge_dir         ./models \
+    --router_type     learned \
+    --router_model_path ./models/atr_router \
+    --max_iter 5 --device cuda --require_cuda \
+    --final_synthesis \
+    --save_file_path output/atr_tatqa.jsonl
+
+python scripts/eval_tatqa.py --result_file output/atr_tatqa.jsonl
+```
+
+The official TAT-QA evaluator is invoked at the end of `scripts/eval_tatqa.py`; if it
+is not on your `PYTHONPATH`, set `TATQA_DIR` to a checkout of
+https://github.com/NExTplusplus/TAT-QA.
+
+### Recipe C. WTQ unseen-dev (Table 1)
+
+Identical to Recipe A but with `$DATA_DIR/wtq_unseen_flat.json`,
+`$DATA_DIR/wtq_excel/` and an `index/wtq_multiview` save path.
+
+### Recipe D. Cross-backbone matrix (Table 2, backbone block)
+
+Repeat Recipe A with `--backbone gemini-pro`, `--backbone claude-haiku-45`,
+`--backbone gpt-4o-mini`, `--backbone llama33`, etc. The full set of backbone
+keys is defined in `config_mapping` in `atr/config.py`.
+
+### Recipe E. K_max saturation sweep
+
+```bash
+for K in 1 3 5 7 10; do
+    python -m atr.online.main \
+        --backbone gemini --data_file_path $DATA_DIR/hybridqa_shard50_B.json \
+        --index_path index/hybridqa_multiview --bge_dir ./models \
+        --router_type learned --router_model_path ./models/atr_router \
+        --max_iter $K --final_synthesis --device cuda --require_cuda \
+        --save_file_path output/atr_hybridqa_kmax${K}.jsonl
+done
+```
+
+## Acknowledgements
+
+ATR's `SQL` and `HYBRID` primitives execute against the Flask SQL service
+released with **TableRAG** (Yu et al., EMNLP 2025),
+https://github.com/yxh-y/TableRAG/. This repository ships no code from that
+project; it speaks the service's HTTP interface and expects you to run the
+service from its own release. Please cite their paper if you use it.
+
+The multi-view index is built on **BGE-M3** (Chen et al., 2024) and the
+benchmarks are HybridQA, TAT-QA, and WikiTableQuestions; cite those alongside
+ATR when you report numbers.
+
+## Citation
+
+```bibtex
+@inproceedings{kim2026atr,
+  title     = {Every Answer Has Its Own Path: Agentic Routing for Retrieval-Augmented Table Question Answering},
+  author    = {Kim, A Young and Shin, Jisu and Han, Donghee and Yi, Mun Yong},
+  booktitle = {Proceedings of the 2026 Conference on Empirical Methods in Natural Language Processing},
+  year      = {2026}
+}
+```
