@@ -1,0 +1,22 @@
+# LLM clients
+openai>=1.40
+anthropic[vertex]>=0.39
+google-auth>=2.30
+httpx>=0.28
+requests>=2.32
+
+# Retrieval and router training
+torch>=2.2
+transformers>=4.41
+faiss-cpu>=1.8
+langchain-text-splitters>=0.2
+
+# Tables and index storage
+numpy>=1.26
+pandas>=2.2
+openpyxl>=3.1
+tqdm>=4.66
+
+# SQL constraint validation and service adapter
+sqlglot>=25.0
+Flask>=3.0
